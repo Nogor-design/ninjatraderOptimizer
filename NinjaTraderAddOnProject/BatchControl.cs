@@ -471,19 +471,21 @@ namespace NinjaTraderAddOnProject
 
                     List<object> results = StrategyAnalyzerAutomation.GetSelectedResults(saWindow).ToList();
 
+                    string settingsPath = Path.Combine(subFolder, "Settings.csv");
                     string summaryPath = Path.Combine(subFolder, "Summary.csv");
                     string tradesPath = Path.Combine(subFolder, "Trades.csv");
                     string ordersPath = Path.Combine(subFolder, "Orders.csv");
                     string executionsPath = Path.Combine(subFolder, "Executions.csv");
                     string analysisPath = Path.Combine(subFolder, "Analysis.csv");
 
+                    WriteSettingsCsv(settingsPath, results);
                     WriteSummaryCsv(summaryPath, results);
                     WriteTradesCsv(tradesPath, results);
                     WriteOrdersCsv(ordersPath, results);
                     WriteExecutionsCsv(executionsPath, results);
                     WriteAnalysisCsv(analysisPath, results);
 
-                    Log("Exported 5 internal CSV files to " + subFolder);
+                    Log("Exported 6 internal CSV files to " + subFolder);
                 }
                 catch (Exception ex)
                 {
@@ -492,7 +494,7 @@ namespace NinjaTraderAddOnProject
             });
         }
 
-        private void WriteSummaryCsv(string fileName, List<object> results)
+        private void WriteSettingsCsv(string fileName, List<object> results)
         {
             var sb = new StringBuilder();
             string[] headers = new[]
@@ -528,6 +530,11 @@ namespace NinjaTraderAddOnProject
                 sb.AppendLine(string.Join(",", values.Select(EscapeCsv)));
             }
             File.WriteAllText(fileName, sb.ToString(), Encoding.UTF8);
+        }
+
+        private void WriteSummaryCsv(string fileName, List<object> results)
+        {
+            WritePerformanceMetricsCsv(fileName, results, GetSummaryMetrics());
         }
 
         private void WriteTradesCsv(string fileName, List<object> results)
@@ -632,16 +639,13 @@ namespace NinjaTraderAddOnProject
 
         private void WriteAnalysisCsv(string fileName, List<object> results)
         {
+            WritePerformanceMetricsCsv(fileName, results, GetAnalysisMetrics(results));
+        }
+
+        private void WritePerformanceMetricsCsv(string fileName, List<object> results, IEnumerable<string> metrics)
+        {
             var sb = new StringBuilder();
             sb.AppendLine("ResultIdx,Metric,All,Long,Short");
-
-            string[] metrics =
-            {
-                "TotalNetProfit", "GrossProfit", "GrossLoss", "ProfitFactor", "MaxDrawdown",
-                "TotalNumTrades", "PercentProfitable", "AverageTrade", "AverageWinningTrade",
-                "AverageLosingTrade", "LargestWinningTrade", "LargestLosingTrade", "SharpeRatio",
-                "SortinoRatio", "UlcerIndex", "RSquared"
-            };
 
             for (int resultIdx = 0; resultIdx < results.Count; resultIdx++)
             {
@@ -664,6 +668,56 @@ namespace NinjaTraderAddOnProject
             }
 
             File.WriteAllText(fileName, sb.ToString(), Encoding.UTF8);
+        }
+
+        private IEnumerable<string> GetSummaryMetrics()
+        {
+            return new[]
+            {
+                "TotalNetProfit", "GrossProfit", "GrossLoss", "ProfitFactor", "MaxDrawdown",
+                "TotalNumTrades", "PercentProfitable", "AverageTrade", "AverageWinningTrade",
+                "AverageLosingTrade", "LargestWinningTrade", "LargestLosingTrade", "SharpeRatio",
+                "SortinoRatio", "UlcerIndex", "RSquared"
+            };
+        }
+
+        private IEnumerable<string> GetAnalysisMetrics(List<object> results)
+        {
+            var metrics = new List<string>();
+            var seen = new HashSet<string>(StringComparer.Ordinal);
+
+            foreach (string metric in GetSummaryMetrics())
+            {
+                metrics.Add(metric);
+                seen.Add(metric);
+            }
+
+            foreach (object result in results)
+            {
+                object summary = GetProperty(result, "SummaryPerformancesCurrency") ?? GetProperty(result, "SummaryPerformances");
+                object all = GetProperty(summary, "All");
+                if (all == null) continue;
+
+                foreach (PropertyInfo property in all.GetType().GetProperties(BindingFlags.Public | BindingFlags.Instance))
+                {
+                    if (!property.CanRead || property.GetIndexParameters().Length > 0) continue;
+                    Type propertyType = Nullable.GetUnderlyingType(property.PropertyType) ?? property.PropertyType;
+                    if (!IsSimpleMetricType(propertyType)) continue;
+                    if (!seen.Add(property.Name)) continue;
+                    metrics.Add(property.Name);
+                }
+            }
+
+            return metrics;
+        }
+
+        private bool IsSimpleMetricType(Type type)
+        {
+            return type.IsPrimitive
+                || type == typeof(decimal)
+                || type == typeof(DateTime)
+                || type == typeof(TimeSpan)
+                || type == typeof(string);
         }
 
         private object GetProperty(object instance, string propertyName)
