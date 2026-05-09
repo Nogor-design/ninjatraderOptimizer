@@ -358,14 +358,18 @@ namespace NinjaTraderAddOnProject
                 string templateName = Path.GetFileNameWithoutExtension(path);
                 XElement element = XElement.Load(path);
                 int resultCountBeforeRun = 0;
+                string originalInstrument = string.Empty;
 
                 Log("Processing in new tab: " + templateName);
                 Dispatcher.Invoke(() =>
                 {
                     try
                     {
+                        originalInstrument = StrategyAnalyzerAutomation.GetSelectedInstrumentOrInstrumentList(saWindow);
                         StrategyAnalyzerAutomation.AddNewTab(saWindow);
                         StrategyAnalyzerAutomation.LoadTemplate(saWindow, element);
+                        StrategyAnalyzerAutomation.SetSelectedInstrumentOrInstrumentList(saWindow, originalInstrument);
+                        Log("Loaded template state: " + StrategyAnalyzerAutomation.GetSelectedTemplateDebug(saWindow));
                         resultCountBeforeRun = StrategyAnalyzerAutomation.GetSelectedResultCount(saWindow);
                     }
                     catch (Exception ex)

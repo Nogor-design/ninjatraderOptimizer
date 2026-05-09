@@ -3,6 +3,7 @@ using NinjaTrader.NinjaScript;
 using System;
 using System.Collections;
 using System.Collections.Generic;
+using System.Globalization;
 using System.Linq;
 using System.Reflection;
 using System.Windows;
@@ -95,7 +96,31 @@ namespace NinjaTrader.Custom.AddOns.Automation
         public static object GetSelectedTabProperties(object saWindow)
         {
             object selectedTab = GetSelectedTab(saWindow);
-            return selectedTab?.GetType().GetProperty("Properties", BindingFlags.Public | BindingFlags.Instance)?.GetValue(selectedTab);
+            return selectedTab?.GetType().GetProperty("TabStrategyProperties", BindingFlags.Public | BindingFlags.Instance)?.GetValue(selectedTab)
+                ?? selectedTab?.GetType().GetProperty("Properties", BindingFlags.Public | BindingFlags.Instance)?.GetValue(selectedTab);
+        }
+
+        public static string GetSelectedInstrumentOrInstrumentList(object saWindow)
+        {
+            return InvokeOnAnalyzerDispatcher(saWindow, () =>
+            {
+                object props = GetSelectedTabProperties(saWindow);
+                return props?.GetType().GetProperty("InstrumentOrInstrumentList", BindingFlags.Public | BindingFlags.Instance)?.GetValue(props) as string;
+            });
+        }
+
+        public static void SetSelectedInstrumentOrInstrumentList(object saWindow, string instrumentOrInstrumentList)
+        {
+            if (string.IsNullOrWhiteSpace(instrumentOrInstrumentList))
+                return;
+
+            InvokeOnAnalyzerDispatcher(saWindow, () =>
+            {
+                object props = GetSelectedTabProperties(saWindow);
+                PropertyInfo property = props?.GetType().GetProperty("InstrumentOrInstrumentList", BindingFlags.Public | BindingFlags.Instance);
+                if (property != null && property.CanWrite)
+                    property.SetValue(props, instrumentOrInstrumentList);
+            });
         }
 
         public static object AddNewTab(object saWindow)
@@ -160,10 +185,134 @@ namespace NinjaTrader.Custom.AddOns.Automation
                 object selectedTab = GetSelectedTab(saWindow);
                 if (selectedTab == null) return;
 
-                // Use the tab's Restore method which is what NT uses for template loading into a tab.
-                var restoreMethod = selectedTab.GetType().GetMethod("Restore", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance, null, new[] { typeof(XElement) }, null);
-                restoreMethod?.Invoke(selectedTab, new object[] { element });
+                object props = GetSelectedTabProperties(saWindow);
+                if (props == null) return;
+
+                string strategyTypeName = element.Element("StrategyType")?.Value;
+                Type strategyType = ResolveType(strategyTypeName);
+                string strategyName = strategyType?.Name ?? strategyTypeName?.Split('.').Last();
+                if (string.IsNullOrWhiteSpace(strategyName))
+                    return;
+
+                PropertyInfo suppressStrategyChange = props.GetType().GetProperty("SuppressStrategyChange", BindingFlags.Public | BindingFlags.Instance);
+                try
+                {
+                    suppressStrategyChange?.SetValue(props, true);
+                    props.GetType().GetProperty("Strategy", BindingFlags.Public | BindingFlags.Instance)?.SetValue(props, strategyName);
+
+                    object strategyTemplate = null;
+                    XElement strategyElement = element.Element("Strategy")?.Elements().FirstOrDefault();
+                    if (strategyType != null)
+                    {
+                        strategyTemplate = Activator.CreateInstance(strategyType);
+                        ApplySimpleXmlProperties(strategyTemplate, strategyElement);
+                        props.GetType().GetProperty("StrategyTemplate", BindingFlags.Public | BindingFlags.Instance)?.SetValue(props, strategyTemplate);
+                    }
+                }
+                finally
+                {
+                    suppressStrategyChange?.SetValue(props, false);
+                }
+
+                ApplyOptimizerTemplate(selectedTab, element);
             });
+        }
+
+        public static string GetSelectedTemplateDebug(object saWindow)
+        {
+            return InvokeOnAnalyzerDispatcher(saWindow, () =>
+            {
+                object props = GetSelectedTabProperties(saWindow);
+                object template = props?.GetType().GetProperty("StrategyTemplate", BindingFlags.Public | BindingFlags.Instance)?.GetValue(props);
+                string strategy = props?.GetType().GetProperty("Strategy", BindingFlags.Public | BindingFlags.Instance)?.GetValue(props) as string;
+                return "Strategy=" + (strategy ?? "null") + ", TemplateType=" + (template?.GetType().FullName ?? "null");
+            });
+        }
+
+        private static Type ResolveType(string typeName)
+        {
+            if (string.IsNullOrWhiteSpace(typeName))
+                return null;
+
+            Type type = Type.GetType(typeName, false);
+            if (type != null)
+                return type;
+
+            foreach (Assembly assembly in AppDomain.CurrentDomain.GetAssemblies())
+            {
+                type = assembly.GetType(typeName, false);
+                if (type != null)
+                    return type;
+            }
+
+            return null;
+        }
+
+        private static void ApplySimpleXmlProperties(object target, XElement source)
+        {
+            if (target == null || source == null)
+                return;
+
+            Type targetType = target.GetType();
+            foreach (XElement child in source.Elements())
+            {
+                if (child.HasElements)
+                    continue;
+
+                PropertyInfo property = targetType.GetProperty(child.Name.LocalName, BindingFlags.Public | BindingFlags.Instance);
+                if (property == null || !property.CanWrite)
+                    continue;
+
+                try
+                {
+                    object value = ConvertXmlValue(child.Value, property.PropertyType);
+                    property.SetValue(target, value);
+                }
+                catch
+                {
+                    // Some NinjaTrader properties have custom converters; skip those and keep defaults.
+                }
+            }
+        }
+
+        private static object ConvertXmlValue(string value, Type destinationType)
+        {
+            Type targetType = Nullable.GetUnderlyingType(destinationType) ?? destinationType;
+            if (targetType == typeof(string))
+                return value;
+            if (targetType == typeof(bool))
+                return bool.Parse(value);
+            if (targetType == typeof(DateTime))
+                return DateTime.Parse(value, CultureInfo.InvariantCulture);
+            if (targetType == typeof(TimeSpan))
+                return TimeSpan.Parse(value, CultureInfo.InvariantCulture);
+            if (targetType.IsEnum)
+                return Enum.Parse(targetType, value);
+
+            return Convert.ChangeType(value, targetType, CultureInfo.InvariantCulture);
+        }
+
+        private static void ApplyOptimizerTemplate(object selectedTab, XElement element)
+        {
+            object props = selectedTab?.GetType().GetProperty("TabStrategyProperties", BindingFlags.Public | BindingFlags.Instance)?.GetValue(selectedTab);
+            if (props == null)
+                return;
+
+            XElement backtestType = element.Element("BacktestType");
+            if (backtestType == null || string.IsNullOrWhiteSpace(backtestType.Value))
+                return;
+
+            PropertyInfo property = props.GetType().GetProperty("BacktestType", BindingFlags.Public | BindingFlags.Instance);
+            if (property == null || !property.CanWrite)
+                return;
+
+            try
+            {
+                property.SetValue(props, Enum.Parse(property.PropertyType, backtestType.Value));
+            }
+            catch
+            {
+            }
         }
 
         public static List<string> ExportSelectedTradePerformanceGrids(object saWindow, string destinationFolder)
