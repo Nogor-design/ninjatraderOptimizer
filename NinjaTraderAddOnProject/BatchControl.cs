@@ -461,16 +461,15 @@ namespace NinjaTraderAddOnProject
                 try
                 {
                     string subFolder = Path.Combine(destFolder, templateName);
-                    if (!Directory.Exists(subFolder))
+                    if (Directory.Exists(subFolder))
+                    {
+                        foreach (string existingFile in Directory.GetFiles(subFolder, "*.csv"))
+                            File.Delete(existingFile);
+                    }
+                    else
                         Directory.CreateDirectory(subFolder);
 
                     List<object> results = StrategyAnalyzerAutomation.GetSelectedResults(saWindow).ToList();
-
-                    List<string> nativeExports = StrategyAnalyzerAutomation.ExportSelectedTradePerformanceGrids(saWindow, subFolder);
-                    if (nativeExports.Count > 0)
-                        Log("Native grid export wrote " + nativeExports.Count + " CSV file(s).");
-                    else
-                        Log("Native grid export unavailable; writing internal CSV files.");
 
                     string summaryPath = Path.Combine(subFolder, "Summary.csv");
                     string tradesPath = Path.Combine(subFolder, "Trades.csv");
@@ -478,13 +477,13 @@ namespace NinjaTraderAddOnProject
                     string executionsPath = Path.Combine(subFolder, "Executions.csv");
                     string analysisPath = Path.Combine(subFolder, "Analysis.csv");
 
-                    if (!File.Exists(summaryPath)) WriteSummaryCsv(summaryPath, results);
-                    if (!File.Exists(tradesPath)) WriteTradesCsv(tradesPath, results);
-                    if (!File.Exists(ordersPath)) WriteOrdersCsv(ordersPath, results);
-                    if (!File.Exists(executionsPath)) WriteExecutionsCsv(executionsPath, results);
-                    if (!File.Exists(analysisPath)) WriteAnalysisCsv(analysisPath, results);
+                    WriteSummaryCsv(summaryPath, results);
+                    WriteTradesCsv(tradesPath, results);
+                    WriteOrdersCsv(ordersPath, results);
+                    WriteExecutionsCsv(executionsPath, results);
+                    WriteAnalysisCsv(analysisPath, results);
 
-                    Log("Exported comprehensive results to " + subFolder);
+                    Log("Exported 5 internal CSV files to " + subFolder);
                 }
                 catch (Exception ex)
                 {
