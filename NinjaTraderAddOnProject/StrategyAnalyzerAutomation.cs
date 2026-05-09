@@ -206,6 +206,7 @@ namespace NinjaTrader.Custom.AddOns.Automation
                     {
                         strategyTemplate = Activator.CreateInstance(strategyType);
                         ApplySimpleXmlProperties(strategyTemplate, strategyElement);
+                        ApplyBarsPeriod(strategyTemplate, strategyElement);
                         props.GetType().GetProperty("StrategyTemplate", BindingFlags.Public | BindingFlags.Instance)?.SetValue(props, strategyTemplate);
                     }
                 }
@@ -225,7 +226,10 @@ namespace NinjaTrader.Custom.AddOns.Automation
                 object props = GetSelectedTabProperties(saWindow);
                 object template = props?.GetType().GetProperty("StrategyTemplate", BindingFlags.Public | BindingFlags.Instance)?.GetValue(props);
                 string strategy = props?.GetType().GetProperty("Strategy", BindingFlags.Public | BindingFlags.Instance)?.GetValue(props) as string;
-                return "Strategy=" + (strategy ?? "null") + ", TemplateType=" + (template?.GetType().FullName ?? "null");
+                object barsPeriod = template?.GetType().GetProperty("BarsPeriod", BindingFlags.Public | BindingFlags.Instance)?.GetValue(template);
+                string bars = DescribeBarsPeriod(barsPeriod);
+                string instrument = props?.GetType().GetProperty("InstrumentOrInstrumentList", BindingFlags.Public | BindingFlags.Instance)?.GetValue(props) as string;
+                return "Strategy=" + (strategy ?? "null") + ", TemplateType=" + (template?.GetType().FullName ?? "null") + ", Instrument=" + (instrument ?? "null") + ", Bars=" + (bars ?? "null");
             });
         }
 
@@ -273,6 +277,62 @@ namespace NinjaTrader.Custom.AddOns.Automation
                     // Some NinjaTrader properties have custom converters; skip those and keep defaults.
                 }
             }
+        }
+
+        private static void ApplyBarsPeriod(object strategyTemplate, XElement strategyElement)
+        {
+            XElement barsElement = strategyElement?.Element("BarsPeriodSerializable");
+            object barsPeriod = CreateBarsPeriod(barsElement);
+            if (strategyTemplate == null || barsPeriod == null)
+                return;
+
+            Type strategyType = strategyTemplate.GetType();
+            SetPropertyIfWritable(strategyTemplate, strategyType, "BarsPeriodSerializable", barsPeriod);
+            SetPropertyIfWritable(strategyTemplate, strategyType, "BarsPeriod", barsPeriod);
+
+            PropertyInfo barsPeriodsProperty = strategyType.GetProperty("BarsPeriods", BindingFlags.Public | BindingFlags.Instance);
+            if (barsPeriodsProperty != null && barsPeriodsProperty.CanWrite)
+            {
+                Array barsPeriods = Array.CreateInstance(barsPeriod.GetType(), 1);
+                barsPeriods.SetValue(barsPeriod, 0);
+                barsPeriodsProperty.SetValue(strategyTemplate, barsPeriods);
+            }
+        }
+
+        private static object CreateBarsPeriod(XElement barsElement)
+        {
+            Type barsPeriodType = ResolveType("NinjaTrader.Data.BarsPeriod");
+            if (barsPeriodType == null)
+                return null;
+
+            object barsPeriod = Activator.CreateInstance(barsPeriodType);
+            if (barsElement == null)
+                return barsPeriod;
+
+            ApplySimpleXmlProperties(barsPeriod, barsElement);
+            return barsPeriod;
+        }
+
+        private static void SetPropertyIfWritable(object target, Type targetType, string propertyName, object value)
+        {
+            PropertyInfo property = targetType.GetProperty(propertyName, BindingFlags.Public | BindingFlags.Instance);
+            if (property == null || !property.CanWrite)
+                return;
+
+            if (value == null || property.PropertyType.IsInstanceOfType(value))
+                property.SetValue(target, value);
+        }
+
+        private static string DescribeBarsPeriod(object barsPeriod)
+        {
+            if (barsPeriod == null)
+                return null;
+
+            Type type = barsPeriod.GetType();
+            object barsType = type.GetProperty("BarsPeriodType", BindingFlags.Public | BindingFlags.Instance)?.GetValue(barsPeriod);
+            object value = type.GetProperty("Value", BindingFlags.Public | BindingFlags.Instance)?.GetValue(barsPeriod);
+            object value2 = type.GetProperty("Value2", BindingFlags.Public | BindingFlags.Instance)?.GetValue(barsPeriod);
+            return Convert.ToString(barsType, CultureInfo.InvariantCulture) + " " + Convert.ToString(value, CultureInfo.InvariantCulture) + "/" + Convert.ToString(value2, CultureInfo.InvariantCulture);
         }
 
         private static object ConvertXmlValue(string value, Type destinationType)
