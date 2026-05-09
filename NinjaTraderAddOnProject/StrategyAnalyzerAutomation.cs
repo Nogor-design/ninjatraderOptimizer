@@ -117,9 +117,7 @@ namespace NinjaTrader.Custom.AddOns.Automation
             InvokeOnAnalyzerDispatcher(saWindow, () =>
             {
                 object props = GetSelectedTabProperties(saWindow);
-                PropertyInfo property = props?.GetType().GetProperty("InstrumentOrInstrumentList", BindingFlags.Public | BindingFlags.Instance);
-                if (property != null && property.CanWrite)
-                    property.SetValue(props, instrumentOrInstrumentList);
+                SetMember(props, "instrumentOrInstrumentList", "InstrumentOrInstrumentList", instrumentOrInstrumentList);
             });
         }
 
@@ -194,12 +192,10 @@ namespace NinjaTrader.Custom.AddOns.Automation
                 if (string.IsNullOrWhiteSpace(strategyName))
                     return;
 
-                props.GetType().GetProperty("Strategy", BindingFlags.Public | BindingFlags.Instance)?.SetValue(props, strategyName);
+                SetMember(props, "strategy", "Strategy", strategyName);
 
-                object strategyTemplate = props.GetType().GetProperty("StrategyTemplate", BindingFlags.Public | BindingFlags.Instance)?.GetValue(props);
                 XElement strategyElement = element.Element("Strategy")?.Elements().FirstOrDefault();
-                if (strategyTemplate == null && strategyType != null)
-                    strategyTemplate = Activator.CreateInstance(strategyType);
+                object strategyTemplate = strategyType != null ? Activator.CreateInstance(strategyType) : null;
 
                 if (strategyTemplate != null)
                 {
@@ -297,11 +293,25 @@ namespace NinjaTrader.Custom.AddOns.Automation
             if (props == null || strategyTemplate == null)
                 return;
 
-            props.GetType().GetProperty("StrategyTemplate", BindingFlags.Public | BindingFlags.Instance)?.SetValue(props, strategyTemplate);
+            SetMember(props, "strategyTemplate", "StrategyTemplate", strategyTemplate);
+        }
 
-            FieldInfo field = props.GetType().GetField("strategyTemplate", BindingFlags.NonPublic | BindingFlags.Instance);
-            if (field != null && field.FieldType.IsInstanceOfType(strategyTemplate))
-                field.SetValue(props, strategyTemplate);
+        private static void SetMember(object target, string fieldName, string propertyName, object value)
+        {
+            if (target == null)
+                return;
+
+            Type targetType = target.GetType();
+            FieldInfo field = targetType.GetField(fieldName, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+            if (field != null && (value == null || field.FieldType.IsInstanceOfType(value)))
+            {
+                field.SetValue(target, value);
+                return;
+            }
+
+            PropertyInfo property = targetType.GetProperty(propertyName, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+            if (property != null && property.CanWrite && (value == null || property.PropertyType.IsInstanceOfType(value)))
+                property.SetValue(target, value);
         }
 
         private static object CreateBarsPeriod(XElement barsElement)
@@ -373,7 +383,8 @@ namespace NinjaTrader.Custom.AddOns.Automation
 
             try
             {
-                property.SetValue(props, Enum.Parse(property.PropertyType, backtestType.Value));
+                object enumValue = Enum.Parse(property.PropertyType, backtestType.Value);
+                SetMember(props, "backtestType", "BacktestType", enumValue);
             }
             catch
             {

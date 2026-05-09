@@ -429,6 +429,17 @@ namespace NinjaTraderAddOnProject
 
                     if (stableCount >= 3) return true;
                 }
+                else if (currentCount > resultCountBeforeRun)
+                {
+                    if (currentCount == lastCount) stableCount++;
+                    else stableCount = 0;
+
+                    if (stableCount >= 20)
+                    {
+                        Log("Progress flag still busy, but results have been stable; continuing to export.");
+                        return true;
+                    }
+                }
                 else
                 {
                     stableCount = 0;
