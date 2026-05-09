@@ -1,0 +1,112 @@
+1. Development Workflow Adjustment
+Add a section like:
+
+NinjaTrader Compilation Workflow
+Because NinjaTrader compiles all NinjaScript code internally, developers must:
+
+Use Visual Studio for writing code, IntelliSense, and project structure
+
+Export the compiled DLL or source files
+
+Import into NinjaTrader using Tools → Import → NinjaScript AddOn
+
+Trigger NinjaTrader’s internal compile
+
+Fix any NT-specific errors that only appear inside NT
+
+Repeat
+
+This is unavoidable.
+
+2. Human-in-the-loop Testing Requirement
+Add:
+
+Manual Compilation & Runtime Validation
+Every major change requires:
+
+Importing the AddOn into NinjaTrader
+
+Triggering a compile
+
+Running the AddOn inside NT
+
+Validating UI thread behavior
+
+Validating reflection bindings
+
+Validating Strategy Analyzer automation
+
+This cannot be automated because NinjaTrader does not expose a headless compiler.
+
+3. Visual Studio AddOn Project Integration
+You downloaded the official NT AddOn project — perfect.
+
+Add this to the plan:
+
+Visual Studio AddOn Project Integration
+Use the official NT AddOn template for development
+
+Reference NinjaTrader.Core.dll, NinjaTrader.Gui.dll, and other NT assemblies
+
+Build DLLs in VS
+
+Import DLLs into NinjaTrader for testing
+
+Keep NT and VS projects in sync manually
+
+This gives you:
+
+Proper IntelliSense
+
+Real debugging (attach to NinjaTrader.exe)
+
+Version control
+
+Real project structure
+
+4. Error Handling Strategy
+Because NT compilation errors only appear inside NT, add:
+
+Error Detection & Resolution Workflow
+All compilation errors must be resolved inside NinjaTrader
+
+Maintain a “known errors” checklist for common NT-specific issues
+
+Use logging inside the AddOn to detect runtime reflection failures
+
+Use try/catch around all reflection calls to avoid NT crashes
+
+5. Testing Strategy Update
+Add:
+
+Testing Must Occur Inside NinjaTrader
+UI thread testing
+
+Strategy Analyzer automation testing
+
+Template loading
+
+Exporting results
+
+Multi-objective optimizer behavior
+
+Memory leak detection
+
+VS cannot simulate these.
+
+6. Maintenance Plan Update
+Add:
+
+NinjaTrader Version Lock
+Because internal APIs change:
+
+Lock production to NT 8.1.6.3
+
+Disable auto-updates
+
+Test AddOn after every NT update before upgrading
+
+Maintain a reflection compatibility layer
+
+Please examine C:\Users\Owner\Downloads\CustomMetricOFExample_NT8 as an example
+And also look at the code and the documents in D:\NinjatraderAddons to get an idea of add on development.

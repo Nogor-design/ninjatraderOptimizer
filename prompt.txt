@@ -1,0 +1,99 @@
+I need you to create a complete, detailed project plan for a NinjaTrader 8.1.6.3 development initiative. The plan should include phases, milestones, tasks, dependencies, risks, required skills, estimated timelines, and recommended architecture. The project includes the following components:
+Please use and reference D:\Backup\projects\PythonProject\NinjatraderDocScrapper\LLM_DOCUMENTATION_GUIDE.md for Ninjascript documentation.
+Custom Fitness Algorithm Development
+
+Create a custom fitness class for NinjaTrader 8.1.6.3
+
+Implement scoring logic (profit factor, drawdown penalties, trade count filters, multi‑objective support)
+
+Ensure compatibility with Strategy Analyzer
+
+Document how the fitness class interacts with the optimizer
+
+Custom Optimizer Development
+
+Build a fully custom optimizer (e.g., genetic, Bayesian, or hybrid)
+
+Control iteration count, parameter selection, mutation, crossover, pruning, and adaptive search
+
+Integrate with NinjaTrader’s internal backtest engine
+
+Support multi‑objective optimization
+
+Provide a clean API for future extensions
+
+Hybrid Architecture (Optimizer + Fitness)
+
+Design a modular system where the optimizer handles search logic and the fitness class handles scoring
+
+Define data flow between components
+
+Support hard constraints (min trades, max drawdown) and soft penalties
+
+Support Pareto optimization if needed
+
+Provide diagrams and recommended patterns
+
+Batch Strategy Analyzer Automation AddOn
+
+Build a NinjaScript AddOn (not a strategy)
+
+Automatically load Strategy Analyzer templates from a folder
+
+Run backtests or optimizations for each template
+
+Export Summary, Trades, and Analysis tab data
+
+Save results to a structured folder hierarchy
+
+Loop through all templates and repeat
+
+Use reflection to access internal Strategy Analyzer methods
+
+Handle UI thread invocation
+
+Include error handling, logging, and progress reporting
+
+Template Management Workflow
+
+Read templates from a source folder
+
+Load them into Strategy Analyzer programmatically
+
+After each run, export results to a destination folder
+
+Create subfolders per template
+
+Move to next template automatically
+
+Final Deliverables
+
+Full project plan
+
+Architecture diagrams
+
+Component breakdown
+
+Development timeline
+
+Testing plan
+
+Deployment plan
+
+Maintenance considerations
+
+Please produce:
+
+A high‑level overview
+
+A detailed breakdown of each phase
+
+A recommended development order
+
+Estimated complexity and time requirements
+
+Any assumptions you need to make
+
+A list of potential pitfalls and how to mitigate them
+
+Make the plan extremely detailed and actionable, suitable for a senior developer or a small engineering team.

@@ -1,0 +1,15 @@
+{
+  "tools": {
+    "allowed": [
+      "replace",
+      "write_file",
+      "read_file",
+      "list_directory",
+      "grep_search",
+      "glob"
+    ]
+  },
+  "security": {
+    "enablePermanentToolApproval": true
+  }
+}
