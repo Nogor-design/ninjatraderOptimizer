@@ -194,25 +194,18 @@ namespace NinjaTrader.Custom.AddOns.Automation
                 if (string.IsNullOrWhiteSpace(strategyName))
                     return;
 
-                PropertyInfo suppressStrategyChange = props.GetType().GetProperty("SuppressStrategyChange", BindingFlags.Public | BindingFlags.Instance);
-                try
-                {
-                    suppressStrategyChange?.SetValue(props, true);
-                    props.GetType().GetProperty("Strategy", BindingFlags.Public | BindingFlags.Instance)?.SetValue(props, strategyName);
+                props.GetType().GetProperty("Strategy", BindingFlags.Public | BindingFlags.Instance)?.SetValue(props, strategyName);
 
-                    object strategyTemplate = null;
-                    XElement strategyElement = element.Element("Strategy")?.Elements().FirstOrDefault();
-                    if (strategyType != null)
-                    {
-                        strategyTemplate = Activator.CreateInstance(strategyType);
-                        ApplySimpleXmlProperties(strategyTemplate, strategyElement);
-                        ApplyBarsPeriod(strategyTemplate, strategyElement);
-                        props.GetType().GetProperty("StrategyTemplate", BindingFlags.Public | BindingFlags.Instance)?.SetValue(props, strategyTemplate);
-                    }
-                }
-                finally
+                object strategyTemplate = props.GetType().GetProperty("StrategyTemplate", BindingFlags.Public | BindingFlags.Instance)?.GetValue(props);
+                XElement strategyElement = element.Element("Strategy")?.Elements().FirstOrDefault();
+                if (strategyTemplate == null && strategyType != null)
+                    strategyTemplate = Activator.CreateInstance(strategyType);
+
+                if (strategyTemplate != null)
                 {
-                    suppressStrategyChange?.SetValue(props, false);
+                    ApplySimpleXmlProperties(strategyTemplate, strategyElement);
+                    ApplyBarsPeriod(strategyTemplate, strategyElement);
+                    SetStrategyTemplate(props, strategyTemplate);
                 }
 
                 ApplyOptimizerTemplate(selectedTab, element);
@@ -297,6 +290,18 @@ namespace NinjaTrader.Custom.AddOns.Automation
                 barsPeriods.SetValue(barsPeriod, 0);
                 barsPeriodsProperty.SetValue(strategyTemplate, barsPeriods);
             }
+        }
+
+        private static void SetStrategyTemplate(object props, object strategyTemplate)
+        {
+            if (props == null || strategyTemplate == null)
+                return;
+
+            props.GetType().GetProperty("StrategyTemplate", BindingFlags.Public | BindingFlags.Instance)?.SetValue(props, strategyTemplate);
+
+            FieldInfo field = props.GetType().GetField("strategyTemplate", BindingFlags.NonPublic | BindingFlags.Instance);
+            if (field != null && field.FieldType.IsInstanceOfType(strategyTemplate))
+                field.SetValue(props, strategyTemplate);
         }
 
         private static object CreateBarsPeriod(XElement barsElement)

@@ -232,7 +232,7 @@ namespace NinjaTraderAddOnProject
             if (!string.IsNullOrEmpty(strategyName))
             {
                 string ntTemplates = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments), "NinjaTrader 8", "templates", "Strategy", strategyName);
-                if (Directory.Exists(ntTemplates))
+                if (!isRunning && Directory.Exists(ntTemplates))
                 {
                     txtSourceFolder.Text = ntTemplates;
                     Log("Source folder updated.");
@@ -409,6 +409,7 @@ namespace NinjaTraderAddOnProject
             DateTime deadline = DateTime.Now.Add(timeout);
             int stableCount = 0;
             int lastCount = resultCountBeforeRun;
+            int elapsedSeconds = 0;
 
             while (DateTime.Now < deadline)
             {
@@ -434,6 +435,9 @@ namespace NinjaTraderAddOnProject
                 }
 
                 lastCount = currentCount;
+                elapsedSeconds++;
+                if (elapsedSeconds % 10 == 0)
+                    Log("Waiting for run: results=" + currentCount.ToString(CultureInfo.InvariantCulture) + ", busy=" + busy.ToString(CultureInfo.InvariantCulture) + ".");
                 await Task.Delay(1000);
             }
             return false;
