@@ -8,6 +8,7 @@ using System.Reflection;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Media;
+using System.Windows.Threading;
 using System.Xml.Linq;
 
 namespace NinjaTrader.Custom.AddOns.Automation
@@ -24,7 +25,8 @@ namespace NinjaTrader.Custom.AddOns.Automation
         public static IEnumerable<object> GetStrategyAnalyzers()
         {
             List<object> analyzers = new List<object>();
-            Core.Globals.RandomDispatcher.Invoke(() => {
+            Dispatcher dispatcher = Application.Current?.Dispatcher ?? Core.Globals.RandomDispatcher;
+            InvokeOnDispatcher(dispatcher, () => {
                 foreach (Window w in Application.Current.Windows)
                 {
                     if (saType.IsInstanceOfType(w))
@@ -32,6 +34,36 @@ namespace NinjaTrader.Custom.AddOns.Automation
                 }
             });
             return analyzers;
+        }
+
+        private static Dispatcher GetDispatcher(object saWindow)
+        {
+            if (saWindow is DispatcherObject dispatcherObject)
+                return dispatcherObject.Dispatcher;
+
+            return Application.Current?.Dispatcher ?? Core.Globals.RandomDispatcher;
+        }
+
+        private static void InvokeOnAnalyzerDispatcher(object saWindow, Action action)
+        {
+            InvokeOnDispatcher(GetDispatcher(saWindow), action);
+        }
+
+        private static T InvokeOnAnalyzerDispatcher<T>(object saWindow, Func<T> action)
+        {
+            Dispatcher dispatcher = GetDispatcher(saWindow);
+            if (dispatcher == null || dispatcher.CheckAccess())
+                return action();
+
+            return (T)dispatcher.Invoke(action);
+        }
+
+        private static void InvokeOnDispatcher(Dispatcher dispatcher, Action action)
+        {
+            if (dispatcher == null || dispatcher.CheckAccess())
+                action();
+            else
+                dispatcher.Invoke(action);
         }
 
         public static string GetSelectedStrategyName(object saWindow)
@@ -71,7 +103,7 @@ namespace NinjaTrader.Custom.AddOns.Automation
             if (saWindow == null || !saType.IsInstanceOfType(saWindow)) return null;
 
             object newTab = null;
-            Core.Globals.RandomDispatcher.Invoke(() =>
+            InvokeOnAnalyzerDispatcher(saWindow, () =>
             {
                 object viewModel = GetViewModel(saWindow);
                 if (viewModel == null || saTabType == null)
@@ -87,19 +119,25 @@ namespace NinjaTrader.Custom.AddOns.Automation
 
         public static int GetSelectedResultCount(object saWindow)
         {
-            object selectedTab = GetSelectedTab(saWindow);
-            object results = selectedTab?.GetType().GetProperty("Results", BindingFlags.Public | BindingFlags.Instance)?.GetValue(selectedTab);
-            return (results as ICollection)?.Count ?? 0;
+            return InvokeOnAnalyzerDispatcher(saWindow, () =>
+            {
+                object selectedTab = GetSelectedTab(saWindow);
+                object results = selectedTab?.GetType().GetProperty("Results", BindingFlags.Public | BindingFlags.Instance)?.GetValue(selectedTab);
+                return (results as ICollection)?.Count ?? 0;
+            });
         }
 
         public static bool IsSelectedTabBusy(object saWindow)
         {
-            object selectedTab = GetSelectedTab(saWindow);
-            if (selectedTab == null) return false;
+            return InvokeOnAnalyzerDispatcher(saWindow, () =>
+            {
+                object selectedTab = GetSelectedTab(saWindow);
+                if (selectedTab == null) return false;
 
-            var progressVisible = selectedTab.GetType().GetProperty("IsProgressVisible", BindingFlags.Public | BindingFlags.Instance)?.GetValue(selectedTab);
-            var progressClearWaiting = selectedTab.GetType().GetProperty("IsProgressClearWaiting", BindingFlags.Public | BindingFlags.Instance)?.GetValue(selectedTab);
-            return (progressVisible is bool && (bool)progressVisible) || (progressClearWaiting is bool && (bool)progressClearWaiting);
+                var progressVisible = selectedTab.GetType().GetProperty("IsProgressVisible", BindingFlags.Public | BindingFlags.Instance)?.GetValue(selectedTab);
+                var progressClearWaiting = selectedTab.GetType().GetProperty("IsProgressClearWaiting", BindingFlags.Public | BindingFlags.Instance)?.GetValue(selectedTab);
+                return (progressVisible is bool && (bool)progressVisible) || (progressClearWaiting is bool && (bool)progressClearWaiting);
+            });
         }
 
         public static IEnumerable<object> GetSelectedResults(object saWindow)
@@ -117,12 +155,15 @@ namespace NinjaTrader.Custom.AddOns.Automation
         {
             if (saWindow == null || !saType.IsInstanceOfType(saWindow)) return;
 
-            object selectedTab = GetSelectedTab(saWindow);
-            if (selectedTab == null) return;
+            InvokeOnAnalyzerDispatcher(saWindow, () =>
+            {
+                object selectedTab = GetSelectedTab(saWindow);
+                if (selectedTab == null) return;
 
-            // Use the tab's Restore method which is what NT uses for template loading into a tab
-            var restoreMethod = selectedTab.GetType().GetMethod("Restore", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance, null, new[] { typeof(XElement) }, null);
-            restoreMethod?.Invoke(selectedTab, new object[] { element });
+                // Use the tab's Restore method which is what NT uses for template loading into a tab.
+                var restoreMethod = selectedTab.GetType().GetMethod("Restore", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance, null, new[] { typeof(XElement) }, null);
+                restoreMethod?.Invoke(selectedTab, new object[] { element });
+            });
         }
 
         public static List<string> ExportSelectedTradePerformanceGrids(object saWindow, string destinationFolder)
@@ -131,7 +172,7 @@ namespace NinjaTrader.Custom.AddOns.Automation
             if (saWindow == null || !saType.IsInstanceOfType(saWindow) || tradePerformanceDisplayType == null || ntGridType == null)
                 return exported;
 
-            Core.Globals.RandomDispatcher.Invoke(() =>
+            InvokeOnAnalyzerDispatcher(saWindow, () =>
             {
                 object selectedTab = GetSelectedTab(saWindow);
                 if (selectedTab == null)
@@ -209,7 +250,7 @@ namespace NinjaTrader.Custom.AddOns.Automation
 
             if (runCommand != null)
             {
-                Core.Globals.RandomDispatcher.Invoke(() => {
+                InvokeOnAnalyzerDispatcher(saWindow, () => {
                     if (runCommand.CanExecute(null))
                         runCommand.Execute(null);
                 });
