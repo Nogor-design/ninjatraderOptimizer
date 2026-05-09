@@ -1,0 +1,10 @@
+.idea/
+.vs/
+
+NinjaTraderAddOnProject/bin/
+NinjaTraderAddOnProject/obj/
+*.user
+
+*.suo
+*.cache
+*.log

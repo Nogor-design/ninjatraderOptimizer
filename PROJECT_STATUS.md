@@ -14,25 +14,27 @@ This initiative implements a custom multi-objective optimization framework and a
 - **Features:** Inherits from standard `Optimizer` base; includes a Genetic Algorithm skeleton that correctly accesses `Strategies[0].OptimizationParameters`.
 
 ### Batch Strategy Optimizer AddOn (`AddOnFramework.cs`, `BatchControl.cs`, `StrategyAnalyzerAutomation.cs`)
-- **Status:** **INTEGRATED & FUNCTIONAL UI**
-- **UI Architecture:** Injected directly into the Strategy Analyzer's **Settings Panel** using a `DockPanel` decorator. Styled as a native NinjaTrader category within an `Expander`.
-- **Automation Logic:** 
-  - Subscribes to `StrategyAnalyzerViewModel.PropertyChanged` to dynamically update the template source folder.
-  - Implements a "New Tab" strategy for result isolation.
-  - Uses reflection to invoke internal `StrategyAnalyzer` methods (`Restore`, `OnRun`, `AddNewTab`).
+- **Status:** **COMPILES; READY FOR NT RUNTIME VALIDATION**
+- **UI Architecture:** Injected directly into the Strategy Analyzer's **Settings Panel** using a `DockPanel` decorator. The batch area is now compact by default and expands only when the user enables **Batch mode**, preventing overlap with native Strategy Analyzer settings.
+- **Automation Logic:**
+  - Subscribes to both `StrategyAnalyzerViewModel.PropertyChanged` and selected tab property changes so the UI updates when the user changes **Backtest type** or strategy.
+  - Creates an isolated Strategy Analyzer tab for each template by constructing the internal `StrategyAnalyzerTabControl(viewModel)` before invoking `AddNewTab`.
+  - Loads templates via `StrategyAnalyzerViewModel.Restore(XElement)` and starts runs via `StrategyAnalyzerViewModel.OnRun(...)`.
+  - Exports `Summary.csv` directly from Strategy Analyzer `Results` objects instead of relying on visible/rendered grid discovery.
 
 ## 3. Current State & Known Issues
 
 ### What Works:
-1. **Dynamic Defaults:** The "Source Folder" updates in real-time when the user changes the strategy in the standard settings menu.
-2. **Batch Sequencing:** The system correctly identifies all `.xml` templates in the source folder and loops through them.
-3. **UI Integration:** The AddOn lives natively inside the Settings panel without overlapping standard controls.
-4. **Autonomous Pipeline:** Build and deployment are fully scripted via `MSBuild` and PowerShell.
+1. **Clean Build:** Debug rebuild succeeds with `0 errors` and `0 warnings` using the BuildTools MSBuild command below.
+2. **Dynamic Defaults:** The source folder updates when the selected Strategy Analyzer strategy changes.
+3. **Backtest Type Awareness:** The batch panel watches the selected tab properties and updates labels/actions when the user switches Backtest/Optimize/MultiObjective.
+4. **Batch Sequencing:** The system identifies `.xml` templates in the source folder and loops through them.
+5. **Result Export Path:** Summary CSV export is now based on internal results objects, avoiding the previous grid-render timing failure.
 
-### Critical Blockers:
-1. **New Tab Invocation Error:** Calling `AddNewTab` via reflection currently throws a `TargetInvocationException`. This prevents NinjaTrader from creating a clean environment for each run.
-2. **Export Logic Empty Output:** Because `AddNewTab` is failing, the automation runs within the existing tab. The `FindGrid` visual tree search currently fails to locate the **Summary** or **Trades** grids because they are likely nested deeper or not rendered in the view when the automation script executes.
-3. **Timing/Rendering:** The automation requires precise `Dispatcher` marshaling and potentially event-based hooks into NinjaTrader's internal `OptimizationCompleted` event to ensure the grids are fully rendered before export.
+### Current Runtime Validation Needed:
+1. **Deployment Requires NT Restart:** If NinjaTrader is running, the post-build copy reports `Sharing violation` for `NinjaTraderAddOnProject.dll`. Close NT or use the deployment command below before validating the new UI.
+2. **Runtime Batch Test:** After deployment, open Strategy Analyzer and confirm the settings panel shows `BATCH STRATEGY ANALYZER` with a compact `Batch mode` checkbox, not the old always-expanded `BATCH OPTIMIZER` UI.
+3. **Export Verification:** Run a small batch and confirm `Downloads\output\<template>\Summary.csv` contains at least one result row.
 
 ## 4. Technical Reference for the Next Session
 
@@ -43,17 +45,43 @@ This initiative implements a custom multi-objective optimization framework and a
 - **Result Grids:** `NTGrid` and `StrategyAnalyzerLogGridControl` found in `NinjaTrader.Gui.Tools`.
 
 ### To-Do List:
-1. **Fix `AddNewTab`:** Investigate the parameters required for the `AddNewTab(StrategyAnalyzerTabControl newTab)` method. It may require a manually instantiated `TabControl` rather than `null`.
-2. **Event-Based Synchronization:** Instead of `Task.Delay()`, hook into `ViewModel.OnRunCompleted` or monitor the `Results` collection on the `saTabControl` to trigger the export.
-3. **Refine Grid Search:** Debug the `FindGrid` recursive search. Log every type encountered in the visual tree to identify the specific path to the `Infragistics` grids.
+1. **Runtime Validate New Tab Creation:** Confirm the `StrategyAnalyzerTabControl(viewModel)` construction resolves the old `AddNewTab(null)` `TargetInvocationException`.
+2. **Improve Completion Signal:** Current synchronization polls selected tab result count and progress visibility. If runtime logs show premature export, hook deeper into `OnRunCompleted` or the `Results.CollectionChanged` event.
+3. **Broaden Exports:** Current export writes `Summary.csv`. Add Trades/Orders/Executions CSVs from `SystemPerformance`, `Orders`, and `Executions` if needed.
 
 ## 5. Environment
 - **Target NT Version:** 8.1.6.3 (Lock suggested).
 - **Required DLLs:** `NinjaTrader.Core.dll`, `NinjaTrader.Gui.dll`, `System.Windows.Controls.WpfPropertyGrid.dll`, `InfragisticsWPF.dll`.
 - **Deployment Path:** `Documents\NinjaTrader 8\bin\Custom\NinjaTraderAddOnProject.dll`.
 
-## 6. How to Run
-1. Rebuild the solution using the provided `MSBuild` pipeline.
-2. Open NinjaTrader -> New -> Strategy Analyzer.
-3. Configuration is at the top of the **Settings** panel on the right.
-4. Logs are displayed in the **BATCH OPTIMIZER** log box and the **NinjaScript Output** window.
+## 7. Automated Build & Telemetry Analysis
+
+To achieve a closed-loop development cycle without human-in-the-loop testing, the following pipeline is established:
+
+### Build & Deployment Pipeline
+The agent uses a PowerShell-driven MSBuild sequence to compile and deploy the AddOn. This bypasses the need for the NinjaScript Editor's "Compile" button.
+1. **Compilation:** Run MSBuild on the solution:
+   ```powershell
+   & "C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools\MSBuild\Current\Bin\MSBuild.exe" D:\ninjatraderOptimizer\NinjaTraderAddOnProject.sln /p:Configuration=Debug /t:Rebuild
+   ```
+2. **Deployment:** Force-copy the DLL to the NinjaTrader Custom folder (requires NT8 to be closed):
+   ```powershell
+   Stop-Process -Name NinjaTrader -Force
+   Copy-Item -Path "D:\ninjatraderOptimizer\NinjaTraderAddOnProject\bin\Debug\NinjaTraderAddOnProject.dll" -Destination "$HOME\Documents\NinjaTrader 8\bin\Custom\NinjaTraderAddOnProject.dll" -Force
+   Start-Process -FilePath "C:\Program Files\NinjaTrader 8\bin\NinjaTrader.exe"
+   ```
+
+### Runtime Telemetry & Debugging
+Since NinjaTrader is a GUI application, automated testing relies on reading internal telemetry logs rather than visual inspection.
+1. **Trace Logs:** Located at `Documents\NinjaTrader 8\trace\`. The agent tails the most recent file to catch `TargetInvocationException` or `InvalidOperationException` (cross-thread errors).
+2. **IPC remote triggering:** The AddOn includes a file-watcher for `C:\temp\nt8_command.json`. Writing `{"action": "RunBatch"}` to this file triggers the automation loop remotely.
+3. **Log Analysis:** The agent verifies success by:
+   - Reading the `PROJECT_STATUS.md` log entries.
+   - Checking the `Downloads\output` folder for the presence of generated CSV files.
+   - Searching the trace logs for strings like `"BatchStrategyOptimizer: Injected"`.
+
+### Debugging the Export Bug
+The previous grid-export bug was addressed by exporting from Strategy Analyzer result objects. If export still fails:
+- Tail the newest trace log while clicking the batch run button.
+- Search for `TargetInvocationException`, `InvalidOperationException`, and `BatchStrategyOptimizer`.
+- Check whether `Summary.csv` was created under `Downloads\output\<template>\`.
