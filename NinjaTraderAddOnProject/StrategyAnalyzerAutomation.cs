@@ -7,6 +7,7 @@ using System.Linq;
 using System.Reflection;
 using System.Windows;
 using System.Windows.Controls;
+using System.Windows.Media;
 using System.Xml.Linq;
 
 namespace NinjaTrader.Custom.AddOns.Automation
@@ -17,6 +18,8 @@ namespace NinjaTrader.Custom.AddOns.Automation
         private static Type saType = guiAssembly.GetType("NinjaTrader.Gui.NinjaScript.StrategyAnalyzer.StrategyAnalyzer");
         private static Type saVmType = guiAssembly.GetType("NinjaTrader.Gui.NinjaScript.StrategyAnalyzer.StrategyAnalyzerViewModel");
         private static Type saTabType = guiAssembly.GetType("NinjaTrader.Gui.NinjaScript.StrategyAnalyzer.StrategyAnalyzerTabControl");
+        private static Type tradePerformanceDisplayType = guiAssembly.GetType("NinjaTrader.Gui.TradePerformance.TradePerformanceDisplayType");
+        private static Type ntGridType = guiAssembly.GetType("NinjaTrader.Gui.Tools.NTGrid");
 
         public static IEnumerable<object> GetStrategyAnalyzers()
         {
@@ -67,13 +70,19 @@ namespace NinjaTrader.Custom.AddOns.Automation
         {
             if (saWindow == null || !saType.IsInstanceOfType(saWindow)) return null;
 
-            object viewModel = GetViewModel(saWindow);
-            if (viewModel == null || saTabType == null) return null;
+            object newTab = null;
+            Core.Globals.RandomDispatcher.Invoke(() =>
+            {
+                object viewModel = GetViewModel(saWindow);
+                if (viewModel == null || saTabType == null)
+                    return;
 
-            object newTab = Activator.CreateInstance(saTabType, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance, null, new[] { viewModel }, null);
-            saType.GetMethod("AddNewTab", BindingFlags.Public | BindingFlags.Instance)?.Invoke(saWindow, new[] { newTab });
-            saVmType.GetProperty("SelectedTab", BindingFlags.Public | BindingFlags.Instance)?.SetValue(viewModel, newTab);
-            return newTab;
+                newTab = Activator.CreateInstance(saTabType, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance, null, new[] { viewModel }, null);
+                saType.GetMethod("AddNewTab", BindingFlags.Public | BindingFlags.Instance)?.Invoke(saWindow, new[] { newTab });
+                saVmType.GetProperty("SelectedTab", BindingFlags.Public | BindingFlags.Instance)?.SetValue(viewModel, newTab);
+            });
+
+            return newTab ?? GetSelectedTab(saWindow);
         }
 
         public static int GetSelectedResultCount(object saWindow)
@@ -108,22 +117,109 @@ namespace NinjaTrader.Custom.AddOns.Automation
         {
             if (saWindow == null || !saType.IsInstanceOfType(saWindow)) return;
 
-            var viewModel = saType.GetProperty("ViewModel", BindingFlags.Public | BindingFlags.Instance)?.GetValue(saWindow);
-            if (viewModel == null) return;
+            object selectedTab = GetSelectedTab(saWindow);
+            if (selectedTab == null) return;
 
-            saVmType.GetMethod("Restore", BindingFlags.Public | BindingFlags.Instance, null, new[] { typeof(XElement) }, null)
-                    ?.Invoke(viewModel, new object[] { element });
+            // Use the tab's Restore method which is what NT uses for template loading into a tab
+            var restoreMethod = selectedTab.GetType().GetMethod("Restore", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance, null, new[] { typeof(XElement) }, null);
+            restoreMethod?.Invoke(selectedTab, new object[] { element });
+        }
+
+        public static List<string> ExportSelectedTradePerformanceGrids(object saWindow, string destinationFolder)
+        {
+            List<string> exported = new List<string>();
+            if (saWindow == null || !saType.IsInstanceOfType(saWindow) || tradePerformanceDisplayType == null || ntGridType == null)
+                return exported;
+
+            Core.Globals.RandomDispatcher.Invoke(() =>
+            {
+                object selectedTab = GetSelectedTab(saWindow);
+                if (selectedTab == null)
+                    return;
+
+                object report = selectedTab.GetType().GetField("tradePerformance", BindingFlags.NonPublic | BindingFlags.Instance)?.GetValue(selectedTab);
+                object reportViewModel = selectedTab.GetType().GetProperty("TradePerfViewModel", BindingFlags.Public | BindingFlags.Instance)?.GetValue(selectedTab);
+                if (!(report is DependencyObject reportVisual) || reportViewModel == null)
+                    return;
+
+                foreach (string displayName in new[] { "Summary", "Analysis", "Trades", "Orders", "Executions" })
+                {
+                    try
+                    {
+                        object displayValue = Enum.Parse(tradePerformanceDisplayType, displayName);
+                        reportViewModel.GetType().GetProperty("SelectedDisplayType", BindingFlags.Public | BindingFlags.Instance)?.SetValue(reportViewModel, displayValue);
+                        report.GetType().GetMethod("GenerateSubReport", BindingFlags.NonPublic | BindingFlags.Instance)?.Invoke(report, null);
+                        (report as FrameworkElement)?.UpdateLayout();
+
+                        List<DependencyObject> grids = FindVisualChildren(reportVisual)
+                            .Where(child => ntGridType.IsInstanceOfType(child))
+                            .ToList();
+
+                        for (int i = 0; i < grids.Count; i++)
+                        {
+                            string suffix = grids.Count == 1 ? string.Empty : "_" + (i + 1).ToString();
+                            string fileName = System.IO.Path.Combine(destinationFolder, displayName + suffix + ".csv");
+                            InvokeGridCsvExport(grids[i], fileName);
+                            if (System.IO.File.Exists(fileName))
+                                exported.Add(fileName);
+                        }
+                    }
+                    catch
+                    {
+                        // Native report export is best-effort; callers write internal CSV fallbacks.
+                    }
+                }
+            });
+
+            return exported;
+        }
+
+        private static IEnumerable<DependencyObject> FindVisualChildren(DependencyObject parent)
+        {
+            if (parent == null)
+                yield break;
+
+            int count = VisualTreeHelper.GetChildrenCount(parent);
+            for (int i = 0; i < count; i++)
+            {
+                DependencyObject child = VisualTreeHelper.GetChild(parent, i);
+                yield return child;
+
+                foreach (DependencyObject grandChild in FindVisualChildren(child))
+                    yield return grandChild;
+            }
+        }
+
+        private static void InvokeGridCsvExport(object grid, string fileName)
+        {
+            MethodInfo method = ntGridType.GetMethod("OnExportToCsv", BindingFlags.NonPublic | BindingFlags.Instance);
+            method?.Invoke(grid, new object[] { fileName });
         }
 
         public static void Run(object saWindow)
         {
             if (saWindow == null || !saType.IsInstanceOfType(saWindow)) return;
 
-            var viewModel = saType.GetProperty("ViewModel", BindingFlags.Public | BindingFlags.Instance)?.GetValue(saWindow);
+            var viewModel = GetViewModel(saWindow);
             if (viewModel == null) return;
 
-            saVmType.GetMethod("OnRun", BindingFlags.NonPublic | BindingFlags.Instance)
-                    ?.Invoke(viewModel, new object[] { null, null });
+            // Use the RunCommand field which is the ICommand for starting backtests
+            var runCommandField = saVmType.GetField("RunCommand", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.Static);
+            var runCommand = runCommandField?.GetValue(viewModel) as System.Windows.Input.ICommand;
+
+            if (runCommand != null)
+            {
+                Core.Globals.RandomDispatcher.Invoke(() => {
+                    if (runCommand.CanExecute(null))
+                        runCommand.Execute(null);
+                });
+            }
+            else
+            {
+                // Fallback to OnRun handler if command field not found
+                saVmType.GetMethod("OnRun", BindingFlags.NonPublic | BindingFlags.Instance)
+                        ?.Invoke(viewModel, new object[] { null, null });
+            }
         }
     }
 }

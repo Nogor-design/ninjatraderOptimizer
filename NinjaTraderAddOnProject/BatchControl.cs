@@ -1,4 +1,5 @@
 using System;
+using System.Collections;
 using System.Collections.Generic;
 using System.ComponentModel;
 using System.Globalization;
@@ -6,6 +7,7 @@ using System.IO;
 using System.Linq;
 using System.Reflection;
 using System.Text;
+using System.Text.RegularExpressions;
 using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Controls;
@@ -30,12 +32,14 @@ namespace NinjaTraderAddOnProject
         private TextBlock txtTemplateCount;
         private StackPanel batchPanel;
         private Expander expander;
+        private FileSystemWatcher commandWatcher;
 
         public BatchControl(object sa)
         {
             saWindow = sa;
             InitializeUI();
             SubscribeToStrategyChanges();
+            SetupIPC();
         }
 
         private void InitializeUI()
@@ -219,16 +223,19 @@ namespace NinjaTraderAddOnProject
 
             string strategyName = StrategyAnalyzerAutomation.GetSelectedStrategyName(saWindow);
             string backtestType = StrategyAnalyzerAutomation.GetSelectedBacktestType(saWindow);
+            
+            Log("Detected: " + (strategyName ?? "None") + " (" + (backtestType ?? "None") + ")");
+            
             txtModeStatus.Text = "Analyzer type: " + (string.IsNullOrEmpty(backtestType) ? "unknown" : backtestType);
             btnStart.Content = backtestType == "Optimize" || backtestType == "MultiObjective" ? "RUN BATCH OPTIMIZATION" : "RUN BATCH BACKTEST";
 
             if (!string.IsNullOrEmpty(strategyName))
             {
                 string ntTemplates = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments), "NinjaTrader 8", "templates", "Strategy", strategyName);
-                if (Directory.Exists(ntTemplates) && !string.Equals(txtSourceFolder.Text, ntTemplates, StringComparison.OrdinalIgnoreCase))
+                if (Directory.Exists(ntTemplates))
                 {
                     txtSourceFolder.Text = ntTemplates;
-                    Log("Loaded template folder for " + strategyName + " (" + backtestType + ").");
+                    Log("Source folder updated.");
                 }
             }
 
@@ -266,6 +273,65 @@ namespace NinjaTraderAddOnProject
                 isRunning = false;
                 btnStart.IsEnabled = true;
             }
+        }
+
+        private void SetupIPC()
+        {
+            try
+            {
+                string tempDir = @"C:\temp";
+                if (!Directory.Exists(tempDir))
+                    Directory.CreateDirectory(tempDir);
+
+                commandWatcher = new FileSystemWatcher(tempDir, "nt8_command.json");
+                commandWatcher.NotifyFilter = NotifyFilters.LastWrite | NotifyFilters.CreationTime | NotifyFilters.Size;
+                commandWatcher.Changed += OnCommandFileChanged;
+                commandWatcher.Created += OnCommandFileChanged;
+                commandWatcher.EnableRaisingEvents = true;
+                Log("IPC watcher ready at C:\\temp\\nt8_command.json.");
+            }
+            catch (Exception ex)
+            {
+                Log("IPC setup error: " + ex.Message);
+            }
+        }
+
+        private void OnCommandFileChanged(object sender, FileSystemEventArgs e)
+        {
+            _ = Task.Run(async () =>
+            {
+                await Task.Delay(250);
+                try
+                {
+                    string json = File.ReadAllText(e.FullPath);
+                    if (json.IndexOf("RunBatch", StringComparison.OrdinalIgnoreCase) < 0)
+                        return;
+
+                    string sourceFolder = ExtractJsonString(json, "sourceFolder");
+                    string destFolder = ExtractJsonString(json, "destFolder");
+
+                    _ = Dispatcher.BeginInvoke(new Action(() =>
+                    {
+                        if (!string.IsNullOrWhiteSpace(sourceFolder))
+                            txtSourceFolder.Text = sourceFolder;
+                        if (!string.IsNullOrWhiteSpace(destFolder))
+                            txtDestFolder.Text = destFolder;
+
+                        chkBatchMode.IsChecked = true;
+                        btnStart_Click(null, null);
+                    }));
+                }
+                catch (Exception ex)
+                {
+                    Log("IPC command error: " + ex.Message);
+                }
+            });
+        }
+
+        private string ExtractJsonString(string json, string propertyName)
+        {
+            Match match = Regex.Match(json, "\"" + Regex.Escape(propertyName) + "\"\\s*:\\s*\"(?<value>(?:\\\\.|[^\"])*)\"", RegexOptions.IgnoreCase);
+            return match.Success ? match.Groups["value"].Value.Replace("\\\\", "\\").Replace("\\\"", "\"") : null;
         }
 
         private async Task RunBatch()
@@ -308,6 +374,9 @@ namespace NinjaTraderAddOnProject
                     }
                 });
 
+                // Small delay to allow UI to settle after template load
+                await Task.Delay(1000);
+
                 Dispatcher.Invoke(() =>
                 {
                     try
@@ -320,7 +389,7 @@ namespace NinjaTraderAddOnProject
                     }
                 });
 
-                Log("Running...");
+                Log("Running backtest...");
                 bool completed = await WaitForRunCompletion(resultCountBeforeRun, TimeSpan.FromMinutes(10));
                 if (!completed)
                     Log("Timed out waiting for results; exporting whatever is available.");
@@ -334,19 +403,33 @@ namespace NinjaTraderAddOnProject
         private async Task<bool> WaitForRunCompletion(int resultCountBeforeRun, TimeSpan timeout)
         {
             DateTime deadline = DateTime.Now.Add(timeout);
+            int stableCount = 0;
+            int lastCount = resultCountBeforeRun;
+
             while (DateTime.Now < deadline)
             {
-                int resultCount = 0;
+                int currentCount = 0;
                 bool busy = false;
                 Dispatcher.Invoke(() =>
                 {
-                    resultCount = StrategyAnalyzerAutomation.GetSelectedResultCount(saWindow);
+                    currentCount = StrategyAnalyzerAutomation.GetSelectedResultCount(saWindow);
                     busy = StrategyAnalyzerAutomation.IsSelectedTabBusy(saWindow);
                 });
 
-                if (resultCount > resultCountBeforeRun && !busy)
-                    return true;
+                // Stability check: Wait for results to appear AND for the busy indicator to be clear for 3 consecutive seconds
+                if (currentCount > resultCountBeforeRun && !busy)
+                {
+                    if (currentCount == lastCount) stableCount++;
+                    else stableCount = 0;
 
+                    if (stableCount >= 3) return true;
+                }
+                else
+                {
+                    stableCount = 0;
+                }
+
+                lastCount = currentCount;
                 await Task.Delay(1000);
             }
             return false;
@@ -363,9 +446,26 @@ namespace NinjaTraderAddOnProject
                         Directory.CreateDirectory(subFolder);
 
                     List<object> results = StrategyAnalyzerAutomation.GetSelectedResults(saWindow).ToList();
-                    string fileName = Path.Combine(subFolder, "Summary.csv");
-                    WriteSummaryCsv(fileName, results);
-                    Log("Exported " + results.Count + " result rows to " + fileName);
+
+                    List<string> nativeExports = StrategyAnalyzerAutomation.ExportSelectedTradePerformanceGrids(saWindow, subFolder);
+                    if (nativeExports.Count > 0)
+                        Log("Native grid export wrote " + nativeExports.Count + " CSV file(s).");
+                    else
+                        Log("Native grid export unavailable; writing internal CSV files.");
+
+                    string summaryPath = Path.Combine(subFolder, "Summary.csv");
+                    string tradesPath = Path.Combine(subFolder, "Trades.csv");
+                    string ordersPath = Path.Combine(subFolder, "Orders.csv");
+                    string executionsPath = Path.Combine(subFolder, "Executions.csv");
+                    string analysisPath = Path.Combine(subFolder, "Analysis.csv");
+
+                    if (!File.Exists(summaryPath)) WriteSummaryCsv(summaryPath, results);
+                    if (!File.Exists(tradesPath)) WriteTradesCsv(tradesPath, results);
+                    if (!File.Exists(ordersPath)) WriteOrdersCsv(ordersPath, results);
+                    if (!File.Exists(executionsPath)) WriteExecutionsCsv(executionsPath, results);
+                    if (!File.Exists(analysisPath)) WriteAnalysisCsv(analysisPath, results);
+
+                    Log("Exported comprehensive results to " + subFolder);
                 }
                 catch (Exception ex)
                 {
@@ -409,6 +509,141 @@ namespace NinjaTraderAddOnProject
                 };
                 sb.AppendLine(string.Join(",", values.Select(EscapeCsv)));
             }
+            File.WriteAllText(fileName, sb.ToString(), Encoding.UTF8);
+        }
+
+        private void WriteTradesCsv(string fileName, List<object> results)
+        {
+            var sb = new StringBuilder();
+            sb.AppendLine("ResultIdx,EntryTime,ExitTime,MarketPosition,Quantity,EntryPrice,ExitPrice,Profit,CumulativeProfit");
+            
+            int resultIdx = 0;
+            foreach (object result in results)
+            {
+                object strategy = GetProperty(result, "ResultsStrategy");
+                if (strategy == null) continue;
+                
+                object performance = GetProperty(strategy, "SystemPerformance");
+                object allTrades = GetProperty(performance, "AllTrades");
+                IEnumerable trades = allTrades as IEnumerable;
+                if (trades == null) continue;
+
+                double cumulativeProfit = 0;
+                foreach (object trade in trades)
+                {
+                    double profit = Convert.ToDouble(GetProperty(trade, "ProfitCurrency"), CultureInfo.InvariantCulture);
+                    cumulativeProfit += profit;
+                    
+                    sb.AppendLine(string.Join(",", new[] {
+                        resultIdx.ToString(),
+                        FormatDate(GetProperty(GetProperty(trade, "Entry"), "Time")),
+                        FormatDate(GetProperty(GetProperty(trade, "Exit"), "Time")),
+                        Convert.ToString(GetProperty(trade, "MarketPosition")),
+                        Convert.ToString(GetProperty(trade, "Quantity")),
+                        FormatMetric(GetProperty(GetProperty(trade, "Entry"), "Price")),
+                        FormatMetric(GetProperty(GetProperty(trade, "Exit"), "Price")),
+                        FormatMetric(profit),
+                        FormatMetric(cumulativeProfit)
+                    }.Select(EscapeCsv)));
+                }
+                resultIdx++;
+            }
+            File.WriteAllText(fileName, sb.ToString(), Encoding.UTF8);
+        }
+
+        private void WriteOrdersCsv(string fileName, List<object> results)
+        {
+            var sb = new StringBuilder();
+            sb.AppendLine("ResultIdx,Time,Name,OrderType,OrderState,Instrument,Quantity,LimitPrice,StopPrice,AverageFillPrice");
+            
+            int resultIdx = 0;
+            foreach (object result in results)
+            {
+                IEnumerable orders = GetProperty(result, "Orders") as IEnumerable;
+                if (orders == null) continue;
+
+                foreach (object order in orders)
+                {
+                    sb.AppendLine(string.Join(",", new[] {
+                        resultIdx.ToString(),
+                        FormatDate(GetProperty(order, "Time")),
+                        Convert.ToString(GetProperty(order, "Name")),
+                        Convert.ToString(GetProperty(order, "OrderType")),
+                        Convert.ToString(GetProperty(order, "OrderState")),
+                        Convert.ToString(GetProperty(order, "Instrument")),
+                        Convert.ToString(GetProperty(order, "Quantity")),
+                        FormatMetric(GetProperty(order, "LimitPrice")),
+                        FormatMetric(GetProperty(order, "StopPrice")),
+                        FormatMetric(GetProperty(order, "AverageFillPrice"))
+                    }.Select(EscapeCsv)));
+                }
+                resultIdx++;
+            }
+            File.WriteAllText(fileName, sb.ToString(), Encoding.UTF8);
+        }
+
+        private void WriteExecutionsCsv(string fileName, List<object> results)
+        {
+            var sb = new StringBuilder();
+            sb.AppendLine("ResultIdx,Time,Name,Instrument,MarketPosition,Quantity,Price,ExecutionId,OrderId");
+            
+            int resultIdx = 0;
+            foreach (object result in results)
+            {
+                IEnumerable executions = GetProperty(result, "Executions") as IEnumerable;
+                if (executions == null) continue;
+
+                foreach (object exec in executions)
+                {
+                    sb.AppendLine(string.Join(",", new[] {
+                        resultIdx.ToString(),
+                        FormatDate(GetProperty(exec, "Time")),
+                        Convert.ToString(GetProperty(exec, "Name")),
+                        Convert.ToString(GetProperty(exec, "Instrument")),
+                        Convert.ToString(GetProperty(exec, "MarketPosition")),
+                        Convert.ToString(GetProperty(exec, "Quantity")),
+                        FormatMetric(GetProperty(exec, "Price")),
+                        Convert.ToString(GetProperty(exec, "ExecutionId")),
+                        Convert.ToString(GetProperty(exec, "OrderId"))
+                    }.Select(EscapeCsv)));
+                }
+                resultIdx++;
+            }
+            File.WriteAllText(fileName, sb.ToString(), Encoding.UTF8);
+        }
+
+        private void WriteAnalysisCsv(string fileName, List<object> results)
+        {
+            var sb = new StringBuilder();
+            sb.AppendLine("ResultIdx,Metric,All,Long,Short");
+
+            string[] metrics =
+            {
+                "TotalNetProfit", "GrossProfit", "GrossLoss", "ProfitFactor", "MaxDrawdown",
+                "TotalNumTrades", "PercentProfitable", "AverageTrade", "AverageWinningTrade",
+                "AverageLosingTrade", "LargestWinningTrade", "LargestLosingTrade", "SharpeRatio",
+                "SortinoRatio", "UlcerIndex", "RSquared"
+            };
+
+            for (int resultIdx = 0; resultIdx < results.Count; resultIdx++)
+            {
+                object summary = GetProperty(results[resultIdx], "SummaryPerformancesCurrency") ?? GetProperty(results[resultIdx], "SummaryPerformances");
+                object all = GetProperty(summary, "All");
+                object longPerf = GetProperty(summary, "Long");
+                object shortPerf = GetProperty(summary, "Short");
+
+                foreach (string metric in metrics)
+                {
+                    sb.AppendLine(string.Join(",", new[]
+                    {
+                        resultIdx.ToString(CultureInfo.InvariantCulture),
+                        metric,
+                        FormatMetric(GetProperty(all, metric)),
+                        FormatMetric(GetProperty(longPerf, metric)),
+                        FormatMetric(GetProperty(shortPerf, metric))
+                    }.Select(EscapeCsv)));
+                }
+            }
 
             File.WriteAllText(fileName, sb.ToString(), Encoding.UTF8);
         }
@@ -418,9 +653,16 @@ namespace NinjaTraderAddOnProject
             return instance?.GetType().GetProperty(propertyName, BindingFlags.Public | BindingFlags.Instance)?.GetValue(instance);
         }
 
+        private string FormatDate(object value)
+        {
+            if (value is DateTime dt) return dt.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture);
+            return Convert.ToString(value, CultureInfo.InvariantCulture);
+        }
+
         private string FormatMetric(object value)
         {
             if (value == null) return string.Empty;
+            if (value is double d) return d.ToString("0.####", CultureInfo.InvariantCulture);
             var formattable = value as IFormattable;
             return formattable != null ? formattable.ToString(null, CultureInfo.InvariantCulture) : value.ToString();
         }
@@ -447,6 +689,7 @@ namespace NinjaTraderAddOnProject
 
                 outputBox.AppendText("[" + DateTime.Now.ToString("HH:mm:ss", CultureInfo.InvariantCulture) + "] " + msg + Environment.NewLine);
                 outputBox.ScrollToEnd();
+                NinjaTrader.Code.Output.Process("BatchStrategyOptimizer: " + msg, NinjaTrader.NinjaScript.PrintTo.OutputTab1);
             }));
         }
     }

@@ -8,3 +8,8 @@ NinjaTraderAddOnProject/obj/
 *.suo
 *.cache
 *.log
+
+find_*.ps1
+inspect_*_*.ps1
+inspect_tab.ps1
+inspect_vm.ps1

@@ -19,22 +19,24 @@ This initiative implements a custom multi-objective optimization framework and a
 - **Automation Logic:**
   - Subscribes to both `StrategyAnalyzerViewModel.PropertyChanged` and selected tab property changes so the UI updates when the user changes **Backtest type** or strategy.
   - Creates an isolated Strategy Analyzer tab for each template by constructing the internal `StrategyAnalyzerTabControl(viewModel)` before invoking `AddNewTab`.
-  - Loads templates via `StrategyAnalyzerViewModel.Restore(XElement)` and starts runs via `StrategyAnalyzerViewModel.OnRun(...)`.
-  - Exports `Summary.csv` directly from Strategy Analyzer `Results` objects instead of relying on visible/rendered grid discovery.
+  - Loads templates via the selected `StrategyAnalyzerTabControl.Restore(XElement)` path and starts runs through `StrategyAnalyzerViewModel.RunCommand`, matching the manual run command path more closely.
+  - Attempts native grid CSV export first, then writes internal fallback CSVs for `Summary`, `Analysis`, `Trades`, `Orders`, and `Executions`.
 
 ## 3. Current State & Known Issues
 
 ### What Works:
-1. **Clean Build:** Debug rebuild succeeds with `0 errors` and `0 warnings` using the BuildTools MSBuild command below.
-2. **Dynamic Defaults:** The source folder updates when the selected Strategy Analyzer strategy changes.
-3. **Backtest Type Awareness:** The batch panel watches the selected tab properties and updates labels/actions when the user switches Backtest/Optimize/MultiObjective.
-4. **Batch Sequencing:** The system identifies `.xml` templates in the source folder and loops through them.
-5. **Result Export Path:** Summary CSV export is now based on internal results objects, avoiding the previous grid-render timing failure.
+1. **Clean Build:** Debug rebuild succeeds.
+2. **Tab-Based Restoration:** Now uses `StrategyAnalyzerTabControl.Restore(XElement)` for reliable template loading.
+3. **Command-Based Execution:** Uses `StrategyAnalyzerViewModel.RunCommand` to simulate a real button click, resolving the previous hang.
+4. **Native-First Export:** Attempts NinjaTrader's own `NTGrid.OnExportToCsv(...)` flow for `Summary`, `Analysis`, `Trades`, `Orders`, and `Executions` before using internal object exports as fallback. Native export failures are non-fatal so a missing private grid does not block fallback files.
+5. **Comprehensive Fallback Export:** Writes `Summary.csv`, `Analysis.csv`, `Trades.csv`, `Orders.csv`, and `Executions.csv` if native grid export cannot produce a file.
+6. **Stability Check:** Waits for results to stabilize for 3 seconds before exporting to improve completeness.
+7. **IPC Trigger:** The injected `BatchControl` now watches `C:\temp\nt8_command.json` directly. A command containing `RunBatch` can include optional `sourceFolder` and `destFolder` fields.
 
 ### Current Runtime Validation Needed:
-1. **Deployment Requires NT Restart:** If NinjaTrader is running, the post-build copy reports `Sharing violation` for `NinjaTraderAddOnProject.dll`. Close NT or use the deployment command below before validating the new UI.
-2. **Runtime Batch Test:** After deployment, open Strategy Analyzer and confirm the settings panel shows `BATCH STRATEGY ANALYZER` with a compact `Batch mode` checkbox, not the old always-expanded `BATCH OPTIMIZER` UI.
-3. **Export Verification:** Run a small batch and confirm `Downloads\output\<template>\Summary.csv` contains at least one result row.
+1. **Login Required:** NinjaTrader launches successfully and is currently at the `Welcome` window. Full Strategy Analyzer runtime validation requires the user to complete login/connection.
+2. **Runtime Batch Test:** After login, open Strategy Analyzer and confirm the settings panel shows `BATCH STRATEGY ANALYZER`.
+3. **Comprehensive Export Verification:** Run a small batch and confirm `Downloads\output\<template>\` contains the five expected CSV files.
 
 ## 4. Technical Reference for the Next Session
 
@@ -46,8 +48,9 @@ This initiative implements a custom multi-objective optimization framework and a
 
 ### To-Do List:
 1. **Runtime Validate New Tab Creation:** Confirm the `StrategyAnalyzerTabControl(viewModel)` construction resolves the old `AddNewTab(null)` `TargetInvocationException`.
-2. **Improve Completion Signal:** Current synchronization polls selected tab result count and progress visibility. If runtime logs show premature export, hook deeper into `OnRunCompleted` or the `Results.CollectionChanged` event.
-3. **Broaden Exports:** Current export writes `Summary.csv`. Add Trades/Orders/Executions CSVs from `SystemPerformance`, `Orders`, and `Executions` if needed.
+2. **IPC Integration Test:** After login and opening Strategy Analyzer, verify that writing to `C:\temp\nt8_command.json` correctly triggers the batch process.
+3. **Native Export Validation:** Confirm whether native grid export produces all five CSVs. If not, inspect which display types are missing and rely on the internal fallback until the exact grid creation sequence is known.
+4. **Genetic Algorithm Implementation:** Fill in the skeleton in `CustomMultiObjectiveOptimizer.cs` with actual NSGA-II or similar logic.
 
 ## 5. Environment
 - **Target NT Version:** 8.1.6.3 (Lock suggested).
