@@ -497,81 +497,131 @@ namespace NinjaTraderAddOnProject
         private void WriteSettingsCsv(string fileName, List<object> results)
         {
             var sb = new StringBuilder();
-            string[] headers = new[]
-            {
-                "StrategyName", "Instrument", "From", "To", "Parameters", "TotalNetProfit", "GrossProfit",
-                "GrossLoss", "ProfitFactor", "MaxDrawdown", "TotalNumTrades", "PercentProfitable",
-                "AverageTrade", "SharpeRatio", "SortinoRatio"
-            };
-            sb.AppendLine(string.Join(",", headers.Select(EscapeCsv)));
+            sb.AppendLine("Item,Value,");
 
             foreach (object result in results)
             {
-                object summary = GetProperty(result, "SummaryPerformancesCurrency") ?? GetProperty(result, "SummaryPerformances");
-                object allPerformance = GetProperty(summary, "All");
-                string[] values = new[]
-                {
-                    Convert.ToString(GetProperty(result, "StrategyName"), CultureInfo.InvariantCulture),
-                    Convert.ToString(GetProperty(result, "Instrument"), CultureInfo.InvariantCulture),
-                    Convert.ToString(GetProperty(result, "From"), CultureInfo.InvariantCulture),
-                    Convert.ToString(GetProperty(result, "To"), CultureInfo.InvariantCulture),
-                    Convert.ToString(GetProperty(result, "ParametersString"), CultureInfo.InvariantCulture),
-                    FormatMetric(GetProperty(allPerformance, "TotalNetProfit")),
-                    FormatMetric(GetProperty(allPerformance, "GrossProfit")),
-                    FormatMetric(GetProperty(allPerformance, "GrossLoss")),
-                    FormatMetric(GetProperty(allPerformance, "ProfitFactor")),
-                    FormatMetric(GetProperty(allPerformance, "MaxDrawdown")),
-                    FormatMetric(GetProperty(allPerformance, "TotalNumTrades")),
-                    FormatMetric(GetProperty(allPerformance, "PercentProfitable")),
-                    FormatMetric(GetProperty(allPerformance, "AverageTrade")),
-                    FormatMetric(GetProperty(allPerformance, "SharpeRatio")),
-                    FormatMetric(GetProperty(allPerformance, "SortinoRatio"))
-                };
-                sb.AppendLine(string.Join(",", values.Select(EscapeCsv)));
+                sb.AppendLine("Strategy parameters,,");
+                foreach (KeyValuePair<string, string> parameter in ParseParameters(Convert.ToString(GetProperty(result, "ParametersString"), CultureInfo.InvariantCulture)))
+                    AppendSettingRow(sb, parameter.Key, parameter.Value);
+
+                sb.AppendLine("Data Series,,");
+                AppendSettingRow(sb, "Start date", FormatNtDateOnly(GetProperty(result, "From")));
+                AppendSettingRow(sb, "End date", FormatNtDateOnly(GetProperty(result, "To")));
+                AppendSettingRow(sb, "Price based on", "Last");
+                AppendSettingRow(sb, "Type", "Minute");
+                AppendSettingRow(sb, "Value", "1");
+                AppendSettingRow(sb, "Tick Replay", "False");
+
+                sb.AppendLine("Setup,,");
+                AppendSettingRow(sb, "Include commission", "False");
+                AppendSettingRow(sb, "Commission template", string.Empty);
+                AppendSettingRow(sb, "Label", Convert.ToString(GetProperty(result, "StrategyName"), CultureInfo.InvariantCulture));
+                AppendSettingRow(sb, "Instrument", Convert.ToString(GetProperty(result, "Instrument"), CultureInfo.InvariantCulture));
             }
             File.WriteAllText(fileName, sb.ToString(), Encoding.UTF8);
         }
 
         private void WriteSummaryCsv(string fileName, List<object> results)
         {
-            WritePerformanceMetricsCsv(fileName, results, GetSummaryMetrics());
+            var sb = new StringBuilder();
+
+            foreach (object result in results)
+            {
+                object summary = GetProperty(result, "SummaryPerformancesCurrency") ?? GetProperty(result, "SummaryPerformances");
+                object all = GetProperty(summary, "All");
+                object longPerf = GetProperty(summary, "Long");
+                object shortPerf = GetProperty(summary, "Short");
+
+                sb.AppendLine("Performance,All trades,Long trades,Short trades,");
+                AppendSummaryRow(sb, "Total net profit", all, longPerf, shortPerf, "TotalNetProfit", MetricFormat.Currency);
+                AppendSummaryRow(sb, "Gross profit", all, longPerf, shortPerf, "GrossProfit", MetricFormat.Currency);
+                AppendSummaryRow(sb, "Gross loss", all, longPerf, shortPerf, "GrossLoss", MetricFormat.Currency);
+                AppendSummaryRow(sb, "Commission", all, longPerf, shortPerf, "Commission", MetricFormat.Currency);
+                AppendSummaryRow(sb, "Profit factor", all, longPerf, shortPerf, "ProfitFactor", MetricFormat.Number);
+                AppendSummaryRow(sb, "Max. drawdown", all, longPerf, shortPerf, "MaxDrawdown", MetricFormat.Currency);
+                AppendSummaryRow(sb, "Sharpe ratio", all, longPerf, shortPerf, "SharpeRatio", MetricFormat.Number);
+                AppendSummaryRow(sb, "Sortino ratio", all, longPerf, shortPerf, "SortinoRatio", MetricFormat.Number);
+                AppendSummaryRow(sb, "Ulcer index", all, longPerf, shortPerf, "UlcerIndex", MetricFormat.Number);
+                AppendSummaryRow(sb, "R squared", all, longPerf, shortPerf, "RSquared", MetricFormat.Number);
+                AppendSummaryRow(sb, "Total Fees", all, longPerf, shortPerf, "Fee", MetricFormat.Currency);
+                AppendSummaryRow(sb, "Probability", all, longPerf, shortPerf, "Probability", MetricFormat.Percent);
+                AppendBlankSummaryRow(sb);
+                AppendSingleSummaryRow(sb, "Start date", FormatNtDateOnly(GetProperty(result, "From")));
+                AppendSingleSummaryRow(sb, "Start time", FormatNtTimeOnly(GetProperty(result, "From")));
+                AppendSingleSummaryRow(sb, "End date", FormatNtDateOnly(GetProperty(result, "To")));
+                AppendSingleSummaryRow(sb, "End time", FormatNtTimeOnly(GetProperty(result, "To")));
+                AppendBlankSummaryRow(sb);
+                AppendSummaryRow(sb, "Total # of trades", all, longPerf, shortPerf, "TotalNumTrades", MetricFormat.Integer);
+                AppendSummaryRow(sb, "Percent profitable", all, longPerf, shortPerf, "PercentProfitable", MetricFormat.Percent);
+                AppendSummaryRow(sb, "# of winning trades", all, longPerf, shortPerf, "NumWinningTrades", MetricFormat.Integer);
+                AppendSummaryRow(sb, "# of losing trades", all, longPerf, shortPerf, "NumLosingTrades", MetricFormat.Integer);
+                AppendSummaryRow(sb, "# of even trades", all, longPerf, shortPerf, "NumEvenTrades", MetricFormat.Integer);
+                AppendBlankSummaryRow(sb);
+                AppendSummaryRow(sb, "Total slippage", all, longPerf, shortPerf, "TotalSlippage", MetricFormat.Integer);
+                AppendBlankSummaryRow(sb);
+                AppendSummaryRow(sb, "Avg. trade", all, longPerf, shortPerf, "AverageTrade", MetricFormat.Currency);
+                AppendSummaryRow(sb, "Avg. winning trade", all, longPerf, shortPerf, "AverageWinningTrade", MetricFormat.Currency);
+                AppendSummaryRow(sb, "Avg. losing trade", all, longPerf, shortPerf, "AverageLosingTrade", MetricFormat.Currency);
+                AppendSummaryRow(sb, "Ratio avg. win / avg. loss", all, longPerf, shortPerf, "RatioAvgWinAvgLoss", MetricFormat.Number);
+                AppendBlankSummaryRow(sb);
+                AppendSummaryRow(sb, "Max. consec. winners", all, longPerf, shortPerf, "MaxConsecWinners", MetricFormat.Integer);
+                AppendSummaryRow(sb, "Max. consec. losers", all, longPerf, shortPerf, "MaxConsecLosers", MetricFormat.Integer);
+                AppendSummaryRow(sb, "Largest winning trade", all, longPerf, shortPerf, "LargestWinningTrade", MetricFormat.Currency);
+                AppendSummaryRow(sb, "Largest losing trade", all, longPerf, shortPerf, "LargestLosingTrade", MetricFormat.Currency);
+                AppendBlankSummaryRow(sb);
+                AppendSummaryRow(sb, "Avg. # of trades per day", all, longPerf, shortPerf, "AverageNumTradesPerDay", MetricFormat.Number);
+                AppendSummaryRow(sb, "Avg. time in market", all, longPerf, shortPerf, "AverageTimeInMarket", MetricFormat.Minutes);
+                AppendSummaryRow(sb, "Avg. bars in trade", all, longPerf, shortPerf, "AverageBarsInTrade", MetricFormat.Number);
+            }
+
+            File.WriteAllText(fileName, sb.ToString(), Encoding.UTF8);
         }
 
         private void WriteTradesCsv(string fileName, List<object> results)
         {
             var sb = new StringBuilder();
-            sb.AppendLine("ResultIdx,EntryTime,ExitTime,MarketPosition,Quantity,EntryPrice,ExitPrice,Profit,CumulativeProfit");
+            sb.AppendLine("Trade number,Instrument,Account,Strategy,Market pos.,Qty,Entry price,Exit price,Entry time,Exit time,Entry name,Exit name,Profit,Cum. net profit,Commission,Clearing Fee,Exchange Fee,IP Fee,NFA Fee,MAE,MFE,ETD,Bars,");
             
-            int resultIdx = 0;
             foreach (object result in results)
             {
-                object strategy = GetProperty(result, "ResultsStrategy");
-                if (strategy == null) continue;
-                
-                object performance = GetProperty(strategy, "SystemPerformance");
-                object allTrades = GetProperty(performance, "AllTrades");
-                IEnumerable trades = allTrades as IEnumerable;
-                if (trades == null) continue;
+                List<object> trades = GetTrades(result);
 
                 double cumulativeProfit = 0;
                 foreach (object trade in trades)
                 {
+                    object entry = GetProperty(trade, "Entry");
+                    object exit = GetProperty(trade, "Exit");
                     double profit = Convert.ToDouble(GetProperty(trade, "ProfitCurrency"), CultureInfo.InvariantCulture);
+                    double mfe = GetDouble(GetProperty(trade, "MfeCurrency"));
                     cumulativeProfit += profit;
                     
                     sb.AppendLine(string.Join(",", new[] {
-                        resultIdx.ToString(),
-                        FormatDate(GetProperty(GetProperty(trade, "Entry"), "Time")),
-                        FormatDate(GetProperty(GetProperty(trade, "Exit"), "Time")),
-                        Convert.ToString(GetProperty(trade, "MarketPosition")),
+                        Convert.ToString(GetProperty(trade, "TradeNumber"), CultureInfo.InvariantCulture),
+                        FormatInstrumentName(GetProperty(entry, "Instrument")),
+                        "Backtest",
+                        Convert.ToString(GetProperty(result, "StrategyName"), CultureInfo.InvariantCulture),
+                        Convert.ToString(GetProperty(entry, "MarketPosition"), CultureInfo.InvariantCulture),
                         Convert.ToString(GetProperty(trade, "Quantity")),
-                        FormatMetric(GetProperty(GetProperty(trade, "Entry"), "Price")),
-                        FormatMetric(GetProperty(GetProperty(trade, "Exit"), "Price")),
-                        FormatMetric(profit),
-                        FormatMetric(cumulativeProfit)
+                        FormatPrice(GetProperty(entry, "Price")),
+                        FormatPrice(GetProperty(exit, "Price")),
+                        FormatNtDateTime(GetProperty(entry, "Time")),
+                        FormatNtDateTime(GetProperty(exit, "Time")),
+                        Convert.ToString(GetProperty(entry, "Name"), CultureInfo.InvariantCulture),
+                        Convert.ToString(GetProperty(exit, "Name"), CultureInfo.InvariantCulture),
+                        FormatCurrency(profit),
+                        FormatCurrency(cumulativeProfit),
+                        FormatCurrency(GetProperty(trade, "Commission")),
+                        FormatCurrency(0),
+                        FormatCurrency(0),
+                        FormatCurrency(0),
+                        FormatCurrency(0),
+                        FormatCurrency(GetProperty(trade, "MaeCurrency")),
+                        FormatCurrency(mfe),
+                        FormatCurrency(mfe - profit),
+                        FormatInteger(GetTradeBars(trade))
                     }.Select(EscapeCsv)));
                 }
-                resultIdx++;
             }
             File.WriteAllText(fileName, sb.ToString(), Encoding.UTF8);
         }
@@ -639,30 +689,53 @@ namespace NinjaTraderAddOnProject
 
         private void WriteAnalysisCsv(string fileName, List<object> results)
         {
-            WritePerformanceMetricsCsv(fileName, results, GetAnalysisMetrics(results));
-        }
-
-        private void WritePerformanceMetricsCsv(string fileName, List<object> results, IEnumerable<string> metrics)
-        {
             var sb = new StringBuilder();
-            sb.AppendLine("ResultIdx,Metric,All,Long,Short");
+            sb.AppendLine("Period,#,Cum. net profit,Net profit,Gross profit,Gross loss,Commission,Cum. max. drawdown,Max. drawdown,% Win,Avg. trade,Avg. winner,Avg. loser,Lrg. winner,Lrg. loser,MTR,Avg. MAE,Avg. MFE,Avg. ETD,% Trade,");
 
-            for (int resultIdx = 0; resultIdx < results.Count; resultIdx++)
+            foreach (object result in results)
             {
-                object summary = GetProperty(results[resultIdx], "SummaryPerformancesCurrency") ?? GetProperty(results[resultIdx], "SummaryPerformances");
-                object all = GetProperty(summary, "All");
-                object longPerf = GetProperty(summary, "Long");
-                object shortPerf = GetProperty(summary, "Short");
+                List<object> trades = GetTrades(result);
+                if (trades.Count == 0) continue;
 
-                foreach (string metric in metrics)
+                double cumulativeProfit = 0;
+                double peak = 0;
+                foreach (var group in trades.GroupBy(t => GetTradeEntryTime(t).Date).OrderBy(g => g.Key))
                 {
+                    List<object> periodTrades = group.ToList();
+                    double netProfit = periodTrades.Sum(t => GetDouble(GetProperty(t, "ProfitCurrency")));
+                    double grossProfit = periodTrades.Where(t => GetDouble(GetProperty(t, "ProfitCurrency")) > 0).Sum(t => GetDouble(GetProperty(t, "ProfitCurrency")));
+                    double grossLoss = periodTrades.Where(t => GetDouble(GetProperty(t, "ProfitCurrency")) < 0).Sum(t => GetDouble(GetProperty(t, "ProfitCurrency")));
+                    double commission = periodTrades.Sum(t => GetDouble(GetProperty(t, "Commission")));
+                    int winners = periodTrades.Count(t => GetDouble(GetProperty(t, "ProfitCurrency")) > 0);
+                    int losers = periodTrades.Count(t => GetDouble(GetProperty(t, "ProfitCurrency")) < 0);
+                    double previousCumulative = cumulativeProfit;
+                    cumulativeProfit += netProfit;
+                    peak = Math.Max(peak, previousCumulative);
+                    double maxDrawdown = Math.Min(0, cumulativeProfit - peak);
+                    peak = Math.Max(peak, cumulativeProfit);
+
                     sb.AppendLine(string.Join(",", new[]
                     {
-                        resultIdx.ToString(CultureInfo.InvariantCulture),
-                        metric,
-                        FormatMetric(GetProperty(all, metric)),
-                        FormatMetric(GetProperty(longPerf, metric)),
-                        FormatMetric(GetProperty(shortPerf, metric))
+                        group.Key.ToString("M/d/yyyy", CultureInfo.InvariantCulture),
+                        periodTrades.Count.ToString(CultureInfo.InvariantCulture),
+                        FormatCurrency(cumulativeProfit),
+                        FormatCurrency(netProfit),
+                        FormatCurrency(grossProfit),
+                        FormatCurrency(grossLoss),
+                        FormatCurrency(commission),
+                        FormatCurrency(maxDrawdown),
+                        FormatCurrency(Math.Min(0, netProfit)),
+                        FormatPercent((double)winners / periodTrades.Count),
+                        FormatCurrency(netProfit / periodTrades.Count),
+                        FormatCurrency(winners == 0 ? 0 : grossProfit / winners),
+                        FormatCurrency(losers == 0 ? 0 : grossLoss / losers),
+                        FormatCurrency(periodTrades.Max(t => GetDouble(GetProperty(t, "ProfitCurrency")))),
+                        FormatCurrency(periodTrades.Min(t => GetDouble(GetProperty(t, "ProfitCurrency")))),
+                        FormatNumber(periodTrades.Max(t => GetTradeMinutes(t))),
+                        FormatCurrency(periodTrades.Average(t => GetDouble(GetProperty(t, "MaeCurrency")))),
+                        FormatCurrency(periodTrades.Average(t => GetDouble(GetProperty(t, "MfeCurrency")))),
+                        FormatCurrency(periodTrades.Average(t => GetDouble(GetProperty(t, "MfeCurrency")) - GetDouble(GetProperty(t, "ProfitCurrency")))),
+                        FormatPercent((double)periodTrades.Count / trades.Count)
                     }.Select(EscapeCsv)));
                 }
             }
@@ -670,54 +743,183 @@ namespace NinjaTraderAddOnProject
             File.WriteAllText(fileName, sb.ToString(), Encoding.UTF8);
         }
 
-        private IEnumerable<string> GetSummaryMetrics()
+        private enum MetricFormat
         {
-            return new[]
-            {
-                "TotalNetProfit", "GrossProfit", "GrossLoss", "ProfitFactor", "MaxDrawdown",
-                "TotalNumTrades", "PercentProfitable", "AverageTrade", "AverageWinningTrade",
-                "AverageLosingTrade", "LargestWinningTrade", "LargestLosingTrade", "SharpeRatio",
-                "SortinoRatio", "UlcerIndex", "RSquared"
-            };
+            Currency,
+            Number,
+            Percent,
+            Integer,
+            Minutes
         }
 
-        private IEnumerable<string> GetAnalysisMetrics(List<object> results)
+        private void AppendSettingRow(StringBuilder sb, string item, string value)
         {
-            var metrics = new List<string>();
-            var seen = new HashSet<string>(StringComparer.Ordinal);
-
-            foreach (string metric in GetSummaryMetrics())
-            {
-                metrics.Add(metric);
-                seen.Add(metric);
-            }
-
-            foreach (object result in results)
-            {
-                object summary = GetProperty(result, "SummaryPerformancesCurrency") ?? GetProperty(result, "SummaryPerformances");
-                object all = GetProperty(summary, "All");
-                if (all == null) continue;
-
-                foreach (PropertyInfo property in all.GetType().GetProperties(BindingFlags.Public | BindingFlags.Instance))
-                {
-                    if (!property.CanRead || property.GetIndexParameters().Length > 0) continue;
-                    Type propertyType = Nullable.GetUnderlyingType(property.PropertyType) ?? property.PropertyType;
-                    if (!IsSimpleMetricType(propertyType)) continue;
-                    if (!seen.Add(property.Name)) continue;
-                    metrics.Add(property.Name);
-                }
-            }
-
-            return metrics;
+            sb.AppendLine(string.Join(",", new[] { item, value, string.Empty }.Select(EscapeCsv)));
         }
 
-        private bool IsSimpleMetricType(Type type)
+        private void AppendSummaryRow(StringBuilder sb, string label, object all, object longPerf, object shortPerf, string propertyName, MetricFormat format)
         {
-            return type.IsPrimitive
-                || type == typeof(decimal)
-                || type == typeof(DateTime)
-                || type == typeof(TimeSpan)
-                || type == typeof(string);
+            sb.AppendLine(string.Join(",", new[]
+            {
+                label,
+                FormatMetricValue(GetProperty(all, propertyName), format),
+                FormatMetricValue(GetProperty(longPerf, propertyName), format),
+                FormatMetricValue(GetProperty(shortPerf, propertyName), format),
+                string.Empty
+            }.Select(EscapeCsv)));
+        }
+
+        private void AppendSingleSummaryRow(StringBuilder sb, string label, string value)
+        {
+            sb.AppendLine(string.Join(",", new[] { label, value, string.Empty, string.Empty, string.Empty }.Select(EscapeCsv)));
+        }
+
+        private void AppendBlankSummaryRow(StringBuilder sb)
+        {
+            sb.AppendLine(",,,,");
+        }
+
+        private string FormatMetricValue(object value, MetricFormat format)
+        {
+            if (format == MetricFormat.Currency) return FormatCurrency(value);
+            if (format == MetricFormat.Percent) return FormatPercent(GetDouble(value));
+            if (format == MetricFormat.Integer) return FormatInteger(value);
+            if (format == MetricFormat.Minutes) return FormatNumber(value) + " min";
+            return FormatNumber(value);
+        }
+
+        private List<KeyValuePair<string, string>> ParseParameters(string parameters)
+        {
+            var parsed = new List<KeyValuePair<string, string>>();
+            if (string.IsNullOrWhiteSpace(parameters)) return parsed;
+
+            Match match = Regex.Match(parameters, @"^(.*?)\s*\((.*?)\)\s*$");
+            if (!match.Success) return parsed;
+
+            string[] values = match.Groups[1].Value.Split('/');
+            string[] names = match.Groups[2].Value.Split(',');
+            int count = Math.Min(values.Length, names.Length);
+            for (int i = 0; i < count; i++)
+            {
+                string name = names[i].Trim();
+                if (name.Length == 0) continue;
+                parsed.Add(new KeyValuePair<string, string>(name, values[i].Trim()));
+            }
+
+            return parsed;
+        }
+
+        private List<object> GetTrades(object result)
+        {
+            object strategy = GetProperty(result, "ResultsStrategy");
+            object performance = GetProperty(strategy, "SystemPerformance");
+            IEnumerable trades = GetProperty(performance, "AllTrades") as IEnumerable;
+            if (trades == null) return new List<object>();
+            return trades.Cast<object>().OrderBy(GetTradeEntryTime).ToList();
+        }
+
+        private DateTime GetTradeEntryTime(object trade)
+        {
+            object time = GetProperty(GetProperty(trade, "Entry"), "Time");
+            return time is DateTime dt ? dt : DateTime.MinValue;
+        }
+
+        private double GetTradeMinutes(object trade)
+        {
+            DateTime entry = GetTradeEntryTime(trade);
+            object exitTime = GetProperty(GetProperty(trade, "Exit"), "Time");
+            if (!(exitTime is DateTime exit) || entry == DateTime.MinValue) return 0;
+            return Math.Round((exit - entry).TotalMinutes, 2);
+        }
+
+        private int GetTradeBars(object trade)
+        {
+            object entry = GetProperty(trade, "Entry");
+            object exit = GetProperty(trade, "Exit");
+            int entryBar = GetInt(GetProperty(entry, "BarIndex"));
+            int exitBar = GetInt(GetProperty(exit, "BarIndex"));
+            if (exitBar >= entryBar && entryBar >= 0) return exitBar - entryBar + 1;
+            return 0;
+        }
+
+        private string FormatInstrumentName(object instrument)
+        {
+            string text = Convert.ToString(instrument, CultureInfo.InvariantCulture);
+            const string suffix = " Globex";
+            return text != null && text.EndsWith(suffix, StringComparison.Ordinal) ? text.Substring(0, text.Length - suffix.Length) : text;
+        }
+
+        private string FormatNtDateTime(object value)
+        {
+            if (value is DateTime dt) return dt.ToString("M/d/yyyy h:mm:ss tt", CultureInfo.InvariantCulture);
+            return Convert.ToString(value, CultureInfo.InvariantCulture);
+        }
+
+        private string FormatNtDateOnly(object value)
+        {
+            if (value is DateTime dt) return dt.ToString("M/d/yyyy", CultureInfo.InvariantCulture);
+            return Convert.ToString(value, CultureInfo.InvariantCulture);
+        }
+
+        private string FormatNtTimeOnly(object value)
+        {
+            if (value is DateTime dt) return dt.ToString("h:mm tt", CultureInfo.InvariantCulture);
+            return string.Empty;
+        }
+
+        private string FormatPrice(object value)
+        {
+            return GetDouble(value).ToString("0.00", CultureInfo.InvariantCulture);
+        }
+
+        private string FormatCurrency(object value)
+        {
+            double number = GetDouble(value);
+            string formatted = "$" + Math.Abs(number).ToString("0.00", CultureInfo.InvariantCulture);
+            return number < 0 ? "(" + formatted + ")" : formatted;
+        }
+
+        private string FormatPercent(double value)
+        {
+            return (value * 100).ToString("0.00", CultureInfo.InvariantCulture) + "%";
+        }
+
+        private string FormatNumber(object value)
+        {
+            double number = GetDouble(value);
+            return number.ToString("0.00", CultureInfo.InvariantCulture);
+        }
+
+        private string FormatInteger(object value)
+        {
+            return GetInt(value).ToString(CultureInfo.InvariantCulture);
+        }
+
+        private double GetDouble(object value)
+        {
+            if (value == null) return 0;
+            try
+            {
+                double number = Convert.ToDouble(value, CultureInfo.InvariantCulture);
+                return double.IsNaN(number) || double.IsInfinity(number) ? 0 : number;
+            }
+            catch
+            {
+                return 0;
+            }
+        }
+
+        private int GetInt(object value)
+        {
+            if (value == null) return 0;
+            try
+            {
+                return Convert.ToInt32(value, CultureInfo.InvariantCulture);
+            }
+            catch
+            {
+                return 0;
+            }
         }
 
         private object GetProperty(object instance, string propertyName)
@@ -742,6 +944,8 @@ namespace NinjaTraderAddOnProject
         private string EscapeCsv(string value)
         {
             if (value == null) return string.Empty;
+            if (value.IndexOfAny(new[] { ',', '"', '\r', '\n' }) < 0)
+                return value;
             return "\"" + value.Replace("\"", "\"\"") + "\"";
         }
 
