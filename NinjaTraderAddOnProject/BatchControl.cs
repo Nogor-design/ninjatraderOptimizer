@@ -27,12 +27,15 @@ namespace NinjaTraderAddOnProject
         private TextBox txtDestFolder;
         private TextBox outputBox;
         private Button btnStart;
+        private Button btnCancel;
         private CheckBox chkBatchMode;
         private TextBlock txtModeStatus;
         private TextBlock txtTemplateCount;
         private StackPanel batchPanel;
         private Expander expander;
         private FileSystemWatcher commandWatcher;
+        private bool cancelRequested;
+        private object currentBatchTab;
 
         public BatchControl(object sa)
         {
@@ -110,9 +113,19 @@ namespace NinjaTraderAddOnProject
             };
             batchPanel.Children.Add(destGrid);
 
-            btnStart = new Button { Content = "RUN BATCH BACKTEST", Height = 25, Margin = new Thickness(0, 10, 0, 5), FontWeight = FontWeights.Bold };
+            Grid actionGrid = new Grid { Margin = new Thickness(0, 10, 0, 5) };
+            actionGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+            actionGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+
+            btnStart = new Button { Content = "RUN BATCH BACKTEST", Height = 25, FontWeight = FontWeights.Bold, Margin = new Thickness(0, 0, 5, 0) };
             btnStart.Click += btnStart_Click;
-            batchPanel.Children.Add(btnStart);
+            actionGrid.Children.Add(btnStart);
+
+            btnCancel = new Button { Content = "CANCEL", Height = 25, Width = 70, IsEnabled = false, FontWeight = FontWeights.Bold };
+            btnCancel.Click += btnCancel_Click;
+            Grid.SetColumn(btnCancel, 1);
+            actionGrid.Children.Add(btnCancel);
+            batchPanel.Children.Add(actionGrid);
 
             outputBox = new TextBox
             {
@@ -262,7 +275,9 @@ namespace NinjaTraderAddOnProject
         {
             if (isRunning) return;
             isRunning = true;
+            cancelRequested = false;
             btnStart.IsEnabled = false;
+            btnCancel.IsEnabled = true;
 
             try
             {
@@ -271,7 +286,30 @@ namespace NinjaTraderAddOnProject
             finally
             {
                 isRunning = false;
+                cancelRequested = false;
+                currentBatchTab = null;
                 btnStart.IsEnabled = true;
+                btnCancel.IsEnabled = false;
+            }
+        }
+
+        private void btnCancel_Click(object sender, RoutedEventArgs e)
+        {
+            if (!isRunning)
+                return;
+
+            cancelRequested = true;
+            btnCancel.IsEnabled = false;
+            Log("Cancel requested; stopping after the active run is interrupted.");
+
+            try
+            {
+                if (currentBatchTab != null)
+                    StrategyAnalyzerAutomation.CloseTab(saWindow, currentBatchTab);
+            }
+            catch (Exception ex)
+            {
+                Log("Cancel close-tab error: " + Unwrap(ex));
             }
         }
 
@@ -353,12 +391,13 @@ namespace NinjaTraderAddOnProject
             Log("Starting batch with " + templates.Count + " templates.");
             foreach (string path in templates)
             {
-                if (!isRunning) break;
+                if (!isRunning || cancelRequested) break;
 
                 string templateName = Path.GetFileNameWithoutExtension(path);
                 XElement element = XElement.Load(path);
                 int resultCountBeforeRun = 0;
                 string originalInstrument = string.Empty;
+                object batchTab = null;
 
                 Log("Processing in new tab: " + templateName);
                 Dispatcher.Invoke(() =>
@@ -366,7 +405,8 @@ namespace NinjaTraderAddOnProject
                     try
                     {
                         originalInstrument = StrategyAnalyzerAutomation.GetSelectedInstrumentOrInstrumentList(saWindow);
-                        StrategyAnalyzerAutomation.AddNewTab(saWindow);
+                        batchTab = StrategyAnalyzerAutomation.AddNewTab(saWindow);
+                        currentBatchTab = batchTab;
                         StrategyAnalyzerAutomation.LoadTemplate(saWindow, element);
                         StrategyAnalyzerAutomation.SetSelectedInstrumentOrInstrumentList(saWindow, originalInstrument);
                         Log("Loaded template state: " + StrategyAnalyzerAutomation.GetSelectedTemplateDebug(saWindow));
@@ -380,6 +420,8 @@ namespace NinjaTraderAddOnProject
 
                 // Small delay to allow UI to settle after template load
                 await Task.Delay(1000);
+                if (cancelRequested)
+                    break;
 
                 Dispatcher.Invoke(() =>
                 {
@@ -395,13 +437,23 @@ namespace NinjaTraderAddOnProject
 
                 Log("Running backtest...");
                 bool completed = await WaitForRunCompletion(resultCountBeforeRun, TimeSpan.FromMinutes(10));
+                if (cancelRequested)
+                {
+                    CloseBatchTab(batchTab);
+                    break;
+                }
+
                 if (!completed)
                     Log("Timed out waiting for results; exporting whatever is available.");
 
                 ExportResults(templateName, destFolder);
+                CloseBatchTab(batchTab);
             }
 
-            Log("Batch completed.");
+            if (cancelRequested)
+                Log("Batch cancelled.");
+            else
+                Log("Batch completed.");
         }
 
         private async Task<bool> WaitForRunCompletion(int resultCountBeforeRun, TimeSpan timeout)
@@ -413,6 +465,9 @@ namespace NinjaTraderAddOnProject
 
             while (DateTime.Now < deadline)
             {
+                if (cancelRequested)
+                    return false;
+
                 int currentCount = 0;
                 bool busy = false;
                 Dispatcher.Invoke(() =>
@@ -452,6 +507,26 @@ namespace NinjaTraderAddOnProject
                 await Task.Delay(1000);
             }
             return false;
+        }
+
+        private void CloseBatchTab(object tab)
+        {
+            if (tab == null)
+                return;
+
+            Dispatcher.Invoke(() =>
+            {
+                try
+                {
+                    StrategyAnalyzerAutomation.CloseTab(saWindow, tab);
+                    if (ReferenceEquals(currentBatchTab, tab))
+                        currentBatchTab = null;
+                }
+                catch (Exception ex)
+                {
+                    Log("Close-tab error: " + Unwrap(ex));
+                }
+            });
         }
 
         private void ExportResults(string templateName, string destFolder)

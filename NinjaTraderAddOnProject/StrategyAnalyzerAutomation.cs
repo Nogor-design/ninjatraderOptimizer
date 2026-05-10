@@ -140,6 +140,68 @@ namespace NinjaTrader.Custom.AddOns.Automation
             return newTab ?? GetSelectedTab(saWindow);
         }
 
+        public static void CloseTab(object saWindow, object tab)
+        {
+            if (saWindow == null || tab == null || !saType.IsInstanceOfType(saWindow))
+                return;
+
+            InvokeOnAnalyzerDispatcher(saWindow, () =>
+            {
+                object viewModel = GetViewModel(saWindow);
+                object currentTab = GetSelectedTab(saWindow);
+                int tabCount = GetTabCountCore(saWindow);
+                if (tabCount <= 1)
+                    return;
+
+                saVmType.GetProperty("SelectedTab", BindingFlags.Public | BindingFlags.Instance)?.SetValue(viewModel, tab);
+
+                TabControl tabControl = saType.GetProperty("MainTabControl", BindingFlags.Public | BindingFlags.Instance)?.GetValue(saWindow) as TabControl
+                    ?? saType.GetField("saTabControl", BindingFlags.NonPublic | BindingFlags.Instance)?.GetValue(saWindow) as TabControl;
+                if (tabControl != null)
+                    tabControl.SelectedItem = tab;
+
+                MethodInfo closeMethod = saType.GetMethod("OnCloseTab", BindingFlags.Public | BindingFlags.Instance);
+                if (closeMethod != null)
+                    closeMethod.Invoke(saWindow, null);
+
+                if (ContainsTab(saWindow, tab) && tabControl != null && tabControl.Items.Contains(tab) && tabControl.Items.Count > 1)
+                    tabControl.Items.Remove(tab);
+
+                if (currentTab != null && !ReferenceEquals(currentTab, tab) && ContainsTab(saWindow, currentTab))
+                {
+                    saVmType.GetProperty("SelectedTab", BindingFlags.Public | BindingFlags.Instance)?.SetValue(viewModel, currentTab);
+                    if (tabControl != null)
+                        tabControl.SelectedItem = currentTab;
+                }
+            });
+        }
+
+        private static int GetTabCountCore(object saWindow)
+        {
+            object tabItems = saType.GetProperty("TabItems", BindingFlags.Public | BindingFlags.Instance)?.GetValue(saWindow);
+            if (tabItems is ICollection collection)
+                return collection.Count;
+
+            TabControl tabControl = saType.GetProperty("MainTabControl", BindingFlags.Public | BindingFlags.Instance)?.GetValue(saWindow) as TabControl
+                ?? saType.GetField("saTabControl", BindingFlags.NonPublic | BindingFlags.Instance)?.GetValue(saWindow) as TabControl;
+            return tabControl?.Items.Count ?? 0;
+        }
+
+        private static bool ContainsTab(object saWindow, object tab)
+        {
+            object tabItems = saType.GetProperty("TabItems", BindingFlags.Public | BindingFlags.Instance)?.GetValue(saWindow);
+            if (tabItems is IEnumerable enumerable)
+            {
+                foreach (object item in enumerable)
+                    if (ReferenceEquals(item, tab))
+                        return true;
+            }
+
+            TabControl tabControl = saType.GetProperty("MainTabControl", BindingFlags.Public | BindingFlags.Instance)?.GetValue(saWindow) as TabControl
+                ?? saType.GetField("saTabControl", BindingFlags.NonPublic | BindingFlags.Instance)?.GetValue(saWindow) as TabControl;
+            return tabControl != null && tabControl.Items.Contains(tab);
+        }
+
         public static int GetSelectedResultCount(object saWindow)
         {
             return InvokeOnAnalyzerDispatcher(saWindow, () =>
