@@ -1,20 +1,37 @@
-# Project Status: NinjaTrader 8.1.6.3 Optimizer & Batch Automation Suite
+# Project Status: NinjaTrader 8.1.6.3 Batch Automation AddOn
 
-Last updated: 2026-05-09
+Last updated: 2026-05-11
 
 ## 1. Current Working State
 
 The batch Strategy Analyzer workflow is currently working in NinjaTrader 8.1.6.3.
+
+The standalone custom optimizer workflow has now been smoke-tested end to end with TA Foundation:
+- Phase 1 custom optimizer run exported 500 parser-clean optimization rows.
+- Phase 2 custom optimizer batch exported 8,000 parser-clean optimization rows across 8 templates.
+- Phase 3 daily-risk optimizer batch exported 640 parser-clean optimization rows across 8 templates.
+- Final fixed Backtest batch completed 8 runs and TA Foundation review returned `validation_status=valid` with zero settings contract violations.
+
+The custom optimizer and optimization fitness work has been split into a separate sibling project:
+
+- `NinjaTraderOptimizerProject/`
+
+The main AddOn project no longer compiles the optimizer/fitness classes. This avoids duplicate NinjaScript class definitions when both DLLs are deployed.
 
 Confirmed behavior:
 - The AddOn injects a compact `BATCH STRATEGY ANALYZER` panel into the Strategy Analyzer Settings panel.
 - The panel auto-detects the selected Strategy Analyzer type and selected strategy.
 - The source folder defaults to the selected strategy's template folder when possible.
 - The user can select a folder of `.xml` Strategy Analyzer templates.
+- The user can optionally enable a rolling backtest date range and enter a number of days.
+- Batch start is blocked with a warning if the current Strategy Analyzer tab has no selected instrument.
+- The user can choose whether temporary Analyzer tabs close after each run.
+- The user can choose whether generated template CSV outputs are overwritten.
 - The batch runner opens a temporary Analyzer tab for each template, loads that template, runs it, exports results, then closes the temporary tab.
 - The original user tab remains open.
 - `CANCEL` stops the batch from starting additional templates and tries to close the active temporary tab.
 - Exports are written to `C:\Users\Owner\Downloads\output\<template-name>\`.
+- `BatchRunSummary.csv` is written at the selected destination root with one row per template.
 - Each run cleans prior generated CSV files in that template folder before writing new results.
 - The latest DLL was built, deployed, and tested by the user.
 
@@ -26,24 +43,30 @@ Known unrelated local change:
 
 ## 2. Project Pieces
 
-### Custom Fitness
+### Custom Optimizer/Fitness
 
-File:
-- `NinjaTraderAddOnProject/OptimizationFitnesses/CustomMultiObjectiveFitness.cs`
-
-Status:
-- Compiles.
-- Provides the current custom optimization fitness scaffold and configurable scoring fields.
-
-### Custom Optimizer
-
-File:
-- `NinjaTraderAddOnProject/Optimizers/CustomMultiObjectiveOptimizer.cs`
+Location:
+- `NinjaTraderOptimizerProject/`
 
 Status:
-- Compiles.
-- Still mostly a skeleton for future optimizer work.
-- Future work is likely NSGA-II, Bayesian search, or another multi-objective search strategy.
+- Split from the batch AddOn into its own MSBuild solution and DLL.
+- Builds and deploys as `NinjaTraderOptimizerProject.dll`.
+- Proven end-to-end via TA Foundation: phase 1 (500 rows) → phase 2
+  (8,000 rows / 8 templates) → phase 3 (640 rows / 8 templates) →
+  final fixed Backtests (8 runs, validation_status=valid).
+- Halton-sequence coverage sampling over PopulationSize × Generations
+  iterations, with a duplicate-retry guard.
+- 2026-05-16: added exhaustive-mode short-circuit in `OnOptimize`.
+  When the Cartesian product of parameter value spaces is smaller
+  than `NumberOfIterations`, the optimizer now enumerates each
+  unique combination exactly once via `RunExhaustive()` instead of
+  wasting iterations on duplicates. Fixes a downstream artifact
+  where `KeepBestResults=N` would over-represent the best-scoring
+  combos when many iterations replayed identical parameter sets.
+  See `docs/designs/optimizer_known_issues.md` (in the ta_foundation
+  repo) for the full diagnosis and the live re-test recipe.
+- Future work is likely NSGA-II, Bayesian search, or another
+  multi-objective search strategy.
 
 ### Batch Strategy Analyzer AddOn
 
@@ -90,6 +113,7 @@ Current working approach in `StrategyAnalyzerAutomation.cs`:
 - Resolves template `<StrategyType>`.
 - Instantiates the strategy template.
 - Applies simple XML properties from the template.
+- When enabled in the batch UI, updates the loaded XML's `<From>` and `<To>` values in memory before template loading.
 - Applies `BarsPeriodSerializable`, `BarsPeriod`, and `BarsPeriods[0]`.
 - Writes required Strategy Analyzer backing fields directly:
   - `strategy`
@@ -158,9 +182,20 @@ Current export files per template:
 - `Trades.csv`
 - `Orders.csv`
 - `Executions.csv`
+- `<template-name>_Optimization.csv`
+
+Long template names are shortened for output folder/file paths when needed to avoid Windows legacy path-length export failures. `BatchRunSummary.csv` keeps the full original template name.
+
+Current root-level batch export:
+- `BatchRunSummary.csv`
+  - Includes `Backtest start` and `Backtest end` from the Strategy Analyzer result/template date range.
+  - Includes `Run start time` and `Run end time` for batch execution timing.
 
 Output folder:
 - `C:\Users\Owner\Downloads\output\<template-name>\`
+
+Batch summary location:
+- `C:\Users\Owner\Downloads\output\BatchRunSummary.csv`
 
 Before writing exports:
 - The exporter deletes existing `*.csv` files in that template folder.
@@ -351,13 +386,22 @@ Common issues:
 ## 9. Recommended Next Work
 
 High value:
-1. Add a small `BatchRunSummary.csv` at the destination root with one row per template and headline metrics.
-2. Add a UI checkbox for `Close temporary tabs after each run`.
-3. Add a UI checkbox for `Overwrite existing output`.
+1. Runtime-test optimizer-template loading after restarting NinjaTrader.
+   - Rebuild `NinjaTraderAddOnProject.sln` and `NinjaTraderOptimizerProject.sln`.
+   - Close NinjaTrader before deploying so the post-build copy does not hit a DLL sharing violation.
+   - Run one generated custom optimizer smoke template.
+   - In the batch panel log, confirm `Loaded template state` includes:
+     - `Optimizer=NinjaTrader.NinjaScript.Optimizers.CustomMultiObjectiveOptimizer`
+     - `Fitness=NinjaTrader.NinjaScript.OptimizationFitnesses.CustomMultiObjectiveFitness`
+     - a non-zero `OptimizationParameters` count.
+2. Confirm the custom optimizer/fitness appear in Strategy Analyzer selectors with no duplicate type or load warnings.
+   - A custom optimizer run still appears in NinjaTrader's normal Strategy Analyzer optimization grid.
+   - Execution proof comes from NinjaTrader Output tab 1 messages prefixed `CustomMultiObjectiveOptimizer:` and the diagnostic file `C:\temp\nt8_custom_optimizer.log`.
+3. Confirm the AddOn can export a parser-compatible optimization result CSV for a custom optimizer run.
+   - The AddOn now writes `<template-name>_Optimization.csv` with NinjaTrader optimization-grid style columns.
 4. Improve `Settings.csv` by reading more exact values from `StrategyAnalyzerTabProperties`.
 5. Add exact NinjaTrader-style `Orders.csv` and `Executions.csv` formats if needed.
-6. Implement the actual custom multi-objective optimizer algorithm.
-7. Add better cancellation if a deeper Strategy Analyzer run cancellation hook is discovered.
+6. Add better cancellation if a deeper Strategy Analyzer run cancellation hook is discovered.
 
 Keep in mind:
 - Reflection bindings are version-sensitive.
