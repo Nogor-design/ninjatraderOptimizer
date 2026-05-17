@@ -4,6 +4,7 @@ using System;
 using System.Collections;
 using System.Collections.Generic;
 using System.Globalization;
+using System.IO;
 using System.Linq;
 using System.Reflection;
 using System.Windows;
@@ -232,8 +233,139 @@ namespace NinjaTrader.Custom.AddOns.Automation
             if (results is IEnumerable enumerable)
             {
                 foreach (object item in enumerable)
+                {
                     yield return item;
+                    foreach (object child in GetChildResults(item))
+                        yield return child;
+                }
             }
+        }
+
+        private static IEnumerable<object> GetChildResults(object result)
+        {
+            object children = result?.GetType().GetProperty("Children", BindingFlags.Public | BindingFlags.Instance)?.GetValue(result)
+                ?? result?.GetType().GetField("children", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)?.GetValue(result);
+
+            if (children is IEnumerable enumerable)
+            {
+                foreach (object child in enumerable)
+                    yield return child;
+            }
+        }
+
+        public static void WriteSelectedTabDiagnostics(object saWindow, string fileName)
+        {
+            if (saWindow == null || string.IsNullOrWhiteSpace(fileName))
+                return;
+
+            InvokeOnAnalyzerDispatcher(saWindow, () =>
+            {
+                try
+                {
+                    object selectedTab = GetSelectedTab(saWindow);
+                    var lines = new List<string>();
+                    DumpObjectShape(lines, "SelectedTab", selectedTab, 0);
+
+                    if (selectedTab is DependencyObject visual)
+                        DumpVisualGridShape(lines, visual);
+
+                    File.WriteAllLines(fileName, lines, System.Text.Encoding.UTF8);
+                }
+                catch (Exception ex)
+                {
+                    File.WriteAllText(fileName, "Diagnostics failed: " + ex, System.Text.Encoding.UTF8);
+                }
+            });
+        }
+
+        private static void DumpObjectShape(List<string> lines, string label, object instance, int depth)
+        {
+            if (instance == null || depth > 1)
+                return;
+
+            Type type = instance.GetType();
+            lines.Add(label + " type=" + type.FullName);
+
+            foreach (PropertyInfo property in type.GetProperties(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance).OrderBy(p => p.Name))
+                DumpMemberShape(lines, label + "." + property.Name, () => property.GetValue(instance), property.PropertyType, depth);
+
+            foreach (FieldInfo field in type.GetFields(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance).OrderBy(f => f.Name))
+                DumpMemberShape(lines, label + "." + field.Name, () => field.GetValue(instance), field.FieldType, depth);
+        }
+
+        private static void DumpMemberShape(List<string> lines, string label, Func<object> getValue, Type declaredType, int depth)
+        {
+            object value;
+            try
+            {
+                value = getValue();
+            }
+            catch
+            {
+                return;
+            }
+
+            if (value == null)
+                return;
+
+            Type valueType = value.GetType();
+            int? count = TryGetCount(value);
+            bool interesting = count.HasValue
+                || label.IndexOf("Result", StringComparison.OrdinalIgnoreCase) >= 0
+                || label.IndexOf("Optim", StringComparison.OrdinalIgnoreCase) >= 0
+                || label.IndexOf("Grid", StringComparison.OrdinalIgnoreCase) >= 0;
+
+            if (!interesting)
+                return;
+
+            lines.Add(label + " declared=" + declaredType.FullName + " value=" + valueType.FullName + (count.HasValue ? " count=" + count.Value.ToString(CultureInfo.InvariantCulture) : string.Empty));
+
+            if (depth == 0 && !IsScalar(valueType) && !(value is IEnumerable && !(value is string)))
+                DumpObjectShape(lines, label, value, depth + 1);
+        }
+
+        private static void DumpVisualGridShape(List<string> lines, DependencyObject root)
+        {
+            int gridIndex = 0;
+            foreach (DependencyObject child in FindVisualChildren(root))
+            {
+                if (!ntGridType.IsInstanceOfType(child))
+                    continue;
+
+                gridIndex++;
+                lines.Add("Visual.NTGrid[" + gridIndex.ToString(CultureInfo.InvariantCulture) + "] type=" + child.GetType().FullName);
+                DumpMemberShape(lines, "Visual.NTGrid[" + gridIndex.ToString(CultureInfo.InvariantCulture) + "].ItemsSource", () => child.GetType().GetProperty("ItemsSource", BindingFlags.Public | BindingFlags.Instance)?.GetValue(child), typeof(object), 1);
+                DumpMemberShape(lines, "Visual.NTGrid[" + gridIndex.ToString(CultureInfo.InvariantCulture) + "].Items", () => child.GetType().GetProperty("Items", BindingFlags.Public | BindingFlags.Instance)?.GetValue(child), typeof(object), 1);
+                DumpMemberShape(lines, "Visual.NTGrid[" + gridIndex.ToString(CultureInfo.InvariantCulture) + "].DataContext", () => (child as FrameworkElement)?.DataContext, typeof(object), 1);
+            }
+        }
+
+        private static int? TryGetCount(object value)
+        {
+            if (value is ICollection collection)
+                return collection.Count;
+
+            PropertyInfo countProperty = value.GetType().GetProperty("Count", BindingFlags.Public | BindingFlags.Instance);
+            if (countProperty != null)
+            {
+                try
+                {
+                    object count = countProperty.GetValue(value);
+                    if (count != null)
+                        return Convert.ToInt32(count, CultureInfo.InvariantCulture);
+                }
+                catch
+                {
+                }
+            }
+
+            return null;
+        }
+
+        private static bool IsScalar(Type type)
+        {
+            Type effectiveType = Nullable.GetUnderlyingType(type) ?? type;
+            return effectiveType.IsPrimitive || effectiveType.IsEnum || effectiveType == typeof(string) || effectiveType == typeof(decimal) || effectiveType == typeof(DateTime);
         }
 
         public static void LoadTemplate(object saWindow, XElement element)
@@ -263,10 +395,11 @@ namespace NinjaTrader.Custom.AddOns.Automation
                 {
                     ApplySimpleXmlProperties(strategyTemplate, strategyElement);
                     ApplyBarsPeriod(strategyTemplate, strategyElement);
+                    ApplyOptimizerTemplate(strategyTemplate, element);
                     SetStrategyTemplate(props, strategyTemplate);
                 }
 
-                ApplyOptimizerTemplate(selectedTab, element);
+                ApplyAnalyzerTemplateType(selectedTab, element);
             });
         }
 
@@ -280,7 +413,17 @@ namespace NinjaTrader.Custom.AddOns.Automation
                 object barsPeriod = template?.GetType().GetProperty("BarsPeriod", BindingFlags.Public | BindingFlags.Instance)?.GetValue(template);
                 string bars = DescribeBarsPeriod(barsPeriod);
                 string instrument = props?.GetType().GetProperty("InstrumentOrInstrumentList", BindingFlags.Public | BindingFlags.Instance)?.GetValue(props) as string;
-                return "Strategy=" + (strategy ?? "null") + ", TemplateType=" + (template?.GetType().FullName ?? "null") + ", Instrument=" + (instrument ?? "null") + ", Bars=" + (bars ?? "null");
+                object optimizer = template?.GetType().GetProperty("Optimizer", BindingFlags.Public | BindingFlags.Instance)?.GetValue(template);
+                object fitness = template?.GetType().GetProperty("OptimizationFitness", BindingFlags.Public | BindingFlags.Instance)?.GetValue(template);
+                object optimizationParameters = template?.GetType().GetProperty("OptimizationParameters", BindingFlags.Public | BindingFlags.Instance)?.GetValue(template);
+                int optimizationParameterCount = (optimizationParameters as ICollection)?.Count ?? 0;
+                return "Strategy=" + (strategy ?? "null")
+                    + ", TemplateType=" + (template?.GetType().FullName ?? "null")
+                    + ", Instrument=" + (instrument ?? "null")
+                    + ", Bars=" + (bars ?? "null")
+                    + ", Optimizer=" + (optimizer?.GetType().FullName ?? "null")
+                    + ", Fitness=" + (fitness?.GetType().FullName ?? "null")
+                    + ", OptimizationParameters=" + optimizationParameterCount.ToString(CultureInfo.InvariantCulture);
             });
         }
 
@@ -290,6 +433,10 @@ namespace NinjaTrader.Custom.AddOns.Automation
                 return null;
 
             Type type = Type.GetType(typeName, false);
+            if (type != null)
+                return type;
+
+            type = Type.GetType(typeName + ", NinjaTraderOptimizerProject", false);
             if (type != null)
                 return type;
 
@@ -394,10 +541,31 @@ namespace NinjaTrader.Custom.AddOns.Automation
         {
             PropertyInfo property = targetType.GetProperty(propertyName, BindingFlags.Public | BindingFlags.Instance);
             if (property == null || !property.CanWrite)
+            {
+                Diagnostic("Property not writable: " + targetType.FullName + "." + propertyName + ".");
                 return;
+            }
 
             if (value == null || property.PropertyType.IsInstanceOfType(value))
+            {
                 property.SetValue(target, value);
+            }
+            else
+            {
+                Diagnostic("Property type mismatch: " + targetType.FullName + "." + propertyName + " expects " + property.PropertyType.FullName + " but got " + value.GetType().FullName + ".");
+            }
+        }
+
+        private static void Diagnostic(string message)
+        {
+            try
+            {
+                string path = Path.Combine(Path.GetTempPath(), "nt8_batch_optimizer_loader.log");
+                File.AppendAllText(path, DateTime.Now.ToString("O") + " " + message + Environment.NewLine);
+            }
+            catch
+            {
+            }
         }
 
         private static string DescribeBarsPeriod(object barsPeriod)
@@ -429,14 +597,18 @@ namespace NinjaTrader.Custom.AddOns.Automation
             return Convert.ChangeType(value, targetType, CultureInfo.InvariantCulture);
         }
 
-        private static void ApplyOptimizerTemplate(object selectedTab, XElement element)
+        private static void ApplyAnalyzerTemplateType(object selectedTab, XElement element)
         {
             object props = selectedTab?.GetType().GetProperty("TabStrategyProperties", BindingFlags.Public | BindingFlags.Instance)?.GetValue(selectedTab);
             if (props == null)
                 return;
 
-            XElement backtestType = element.Element("BacktestType");
-            if (backtestType == null || string.IsNullOrWhiteSpace(backtestType.Value))
+            string backtestType = element.Element("BacktestType")?.Value;
+            if (string.IsNullOrWhiteSpace(backtestType))
+                backtestType = element.Element("Strategy")?.Elements().FirstOrDefault()?.Elements().FirstOrDefault(child => child.Name.LocalName == "Category")?.Value;
+            if (string.IsNullOrWhiteSpace(backtestType) && element.Element("OptimizationParameters") != null)
+                backtestType = "Optimize";
+            if (string.IsNullOrWhiteSpace(backtestType))
                 return;
 
             PropertyInfo property = props.GetType().GetProperty("BacktestType", BindingFlags.Public | BindingFlags.Instance);
@@ -445,12 +617,190 @@ namespace NinjaTrader.Custom.AddOns.Automation
 
             try
             {
-                object enumValue = Enum.Parse(property.PropertyType, backtestType.Value);
+                object enumValue = Enum.Parse(property.PropertyType, backtestType);
                 SetMember(props, "backtestType", "BacktestType", enumValue);
             }
             catch
             {
             }
+        }
+
+        private static void ApplyOptimizerTemplate(object strategyTemplate, XElement element)
+        {
+            if (strategyTemplate == null || element == null)
+                return;
+
+            string optimizerTypeName = element.Element("OptimizerType")?.Value;
+            string fitnessTypeName = element.Element("OptimizationFitness")?.Value;
+            Diagnostic("ApplyOptimizerTemplate requested optimizer=" + (optimizerTypeName ?? "null") + ", fitness=" + (fitnessTypeName ?? "null") + ".");
+
+            object optimizer = CreateTemplateObject(optimizerTypeName);
+            if (optimizer != null)
+            {
+                ApplyParameterWrappers(optimizer, element.Element("OptimizerParameters"));
+                SetPropertyIfWritable(strategyTemplate, strategyTemplate.GetType(), "Optimizer", optimizer);
+                Diagnostic("Applied optimizer instance type=" + optimizer.GetType().AssemblyQualifiedName + ".");
+            }
+            else
+            {
+                Diagnostic("Could not create optimizer for type=" + (optimizerTypeName ?? "null") + ".");
+            }
+
+            object fitness = CreateTemplateObject(fitnessTypeName);
+            if (fitness != null)
+            {
+                SetPropertyIfWritable(strategyTemplate, strategyTemplate.GetType(), "OptimizationFitness", fitness);
+                Diagnostic("Applied fitness instance type=" + fitness.GetType().AssemblyQualifiedName + ".");
+            }
+            else
+            {
+                Diagnostic("Could not create fitness for type=" + (fitnessTypeName ?? "null") + ".");
+            }
+
+            ApplyOptimizationParameters(strategyTemplate, element.Element("OptimizationParameters"));
+        }
+
+        private static object CreateTemplateObject(string typeName)
+        {
+            Type type = ResolveType(typeName);
+            if (type == null)
+            {
+                Diagnostic("ResolveType failed for " + (typeName ?? "null") + ".");
+                return null;
+            }
+
+            try
+            {
+                object instance = Activator.CreateInstance(type);
+                InitializeTemplateObject(instance);
+                return instance;
+            }
+            catch (Exception ex)
+            {
+                Diagnostic("CreateTemplateObject failed for " + type.FullName + ": " + ex.Message);
+                return null;
+            }
+        }
+
+        private static void InitializeTemplateObject(object instance)
+        {
+            if (instance == null)
+                return;
+
+            try
+            {
+                MethodInfo setState = instance.GetType().GetMethod("SetState", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                setState?.Invoke(instance, new object[] { State.SetDefaults });
+            }
+            catch
+            {
+                // Keep the raw instance if NinjaTrader refuses state initialization in this context.
+            }
+        }
+
+        private static void ApplyParameterWrappers(object target, XElement wrapperRoot)
+        {
+            XElement wrappers = wrapperRoot?.Elements().FirstOrDefault();
+            if (target == null || wrappers == null)
+                return;
+
+            Type targetType = target.GetType();
+            foreach (XElement wrapper in wrappers.Elements().Where(e => e.Name.LocalName == "ParameterWrapper"))
+            {
+                string name = wrapper.Elements().FirstOrDefault(e => e.Name.LocalName == "Name")?.Value;
+                XElement valueElement = wrapper.Elements().FirstOrDefault(e => e.Name.LocalName == "Value");
+                if (string.IsNullOrWhiteSpace(name) || valueElement == null)
+                    continue;
+
+                PropertyInfo property = targetType.GetProperty(name, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                if (property == null || !property.CanWrite)
+                    continue;
+
+                try
+                {
+                    property.SetValue(target, ConvertXmlValue(valueElement.Value, property.PropertyType));
+                }
+                catch
+                {
+                    // Optimizer wrapper values are optional; keep NinjaTrader defaults if conversion fails.
+                }
+            }
+        }
+
+        private static void ApplyOptimizationParameters(object strategyTemplate, XElement optimizationRoot)
+        {
+            object collection = strategyTemplate?.GetType().GetProperty("OptimizationParameters", BindingFlags.Public | BindingFlags.Instance)?.GetValue(strategyTemplate);
+            if (collection == null || optimizationRoot == null)
+                return;
+
+            MethodInfo clearMethod = collection.GetType().GetMethod("Clear", BindingFlags.Public | BindingFlags.Instance);
+            MethodInfo addMethod = collection.GetType().GetMethod("Add", BindingFlags.Public | BindingFlags.Instance);
+            if (clearMethod == null || addMethod == null)
+                return;
+
+            clearMethod.Invoke(collection, null);
+            XElement parameters = optimizationRoot.Elements().FirstOrDefault();
+            if (parameters == null)
+                return;
+
+            foreach (XElement parameterElement in parameters.Elements().Where(e => e.Name.LocalName == "Parameter"))
+            {
+                Parameter parameter = CreateOptimizationParameter(parameterElement);
+                if (parameter != null)
+                    addMethod.Invoke(collection, new object[] { parameter });
+            }
+        }
+
+        private static Parameter CreateOptimizationParameter(XElement parameterElement)
+        {
+            if (parameterElement == null)
+                return null;
+
+            try
+            {
+                Parameter parameter = new Parameter();
+                parameter.Name = parameterElement.Elements().FirstOrDefault(e => e.Name.LocalName == "Name")?.Value;
+                parameter.ParameterTypeSerializable = parameterElement.Elements().FirstOrDefault(e => e.Name.LocalName == "ParameterTypeSerializable")?.Value;
+                parameter.Increment = Convert.ToDouble(parameterElement.Elements().FirstOrDefault(e => e.Name.LocalName == "Increment")?.Value ?? "1", CultureInfo.InvariantCulture);
+
+                Type parameterType = parameter.ParameterType ?? ResolveType(parameter.ParameterTypeSerializable);
+                if (parameterType != null)
+                    parameter.ParameterType = parameterType;
+
+                XElement minElement = parameterElement.Elements().FirstOrDefault(e => e.Name.LocalName == "Min");
+                XElement maxElement = parameterElement.Elements().FirstOrDefault(e => e.Name.LocalName == "Max");
+                XElement valueElement = parameterElement.Elements().FirstOrDefault(e => e.Name.LocalName == "ValueSerializable");
+
+                if (minElement != null)
+                    parameter.Min = ConvertParameterValue(minElement.Value, parameter.ParameterType);
+                if (maxElement != null)
+                    parameter.Max = ConvertParameterValue(maxElement.Value, parameter.ParameterType);
+                if (valueElement != null)
+                    parameter.Value = ConvertParameterValue(valueElement.Value, parameter.ParameterType);
+
+                string enumValues = parameterElement.Elements().FirstOrDefault(e => e.Name.LocalName == "EnumValuesSerializable")?.Value;
+                if (!string.IsNullOrWhiteSpace(enumValues))
+                    parameter.EnumValuesSerializable = enumValues.Split(new[] { ',' }, StringSplitOptions.RemoveEmptyEntries).Select(v => v.Trim()).ToArray();
+
+                return string.IsNullOrWhiteSpace(parameter.Name) ? null : parameter;
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        private static object ConvertParameterValue(string value, Type parameterType)
+        {
+            Type targetType = Nullable.GetUnderlyingType(parameterType) ?? parameterType;
+            if (targetType == null || targetType == typeof(string))
+                return value;
+            if (targetType == typeof(bool))
+                return bool.Parse(value);
+            if (targetType.IsEnum)
+                return Enum.Parse(targetType, value);
+
+            return Convert.ChangeType(value, targetType, CultureInfo.InvariantCulture);
         }
 
         public static List<string> ExportSelectedTradePerformanceGrids(object saWindow, string destinationFolder)

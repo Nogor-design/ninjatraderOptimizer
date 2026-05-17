@@ -77,8 +77,6 @@
       <DependentUpon>AddOnPage.xaml</DependentUpon>
     </Compile>
     <Compile Include="BatchControl.cs" />
-    <Compile Include="OptimizationFitnesses\CustomMultiObjectiveFitness.cs" />
-    <Compile Include="Optimizers\CustomMultiObjectiveOptimizer.cs" />
     <Compile Include="StrategyAnalyzerAutomation.cs" />
     <Compile Include="Properties\AssemblyInfo.cs">
       <SubType>Code</SubType>

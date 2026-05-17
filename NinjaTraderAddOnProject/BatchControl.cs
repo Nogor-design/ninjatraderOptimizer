@@ -31,11 +31,44 @@ namespace NinjaTraderAddOnProject
         private CheckBox chkBatchMode;
         private TextBlock txtModeStatus;
         private TextBlock txtTemplateCount;
+        private CheckBox chkRollingDateRange;
+        private TextBox txtRollingDays;
+        private CheckBox chkCloseTempTabs;
+        private CheckBox chkOverwriteOutput;
         private StackPanel batchPanel;
         private Expander expander;
         private FileSystemWatcher commandWatcher;
         private bool cancelRequested;
         private object currentBatchTab;
+
+        // Status heartbeat state written to C:\temp\nt8_status.json so the
+        // TA Foundation /optimizer web UI can track progress.
+        private const string StatusFilePath = @"C:\temp\nt8_status.json";
+        private string currentRunId;
+        private string currentDestFolder;
+        private string currentTemplateName;
+        private int currentCompletedCount;
+        private int currentTotalCount;
+        private string lastErrorMessage;
+        private string requestedInstrument;
+
+        private class BatchRunRecord
+        {
+            public string TemplateName { get; set; }
+            public string Status { get; set; }
+            public string Strategy { get; set; }
+            public string Instrument { get; set; }
+            public string TotalNetProfit { get; set; }
+            public string Trades { get; set; }
+            public string ProfitFactor { get; set; }
+            public string MaxDrawdown { get; set; }
+            public string BacktestStart { get; set; }
+            public string BacktestEnd { get; set; }
+            public DateTime RunStartTime { get; set; }
+            public DateTime? RunEndTime { get; set; }
+            public string OutputFolder { get; set; }
+            public string Error { get; set; }
+        }
 
         public BatchControl(object sa)
         {
@@ -112,6 +145,67 @@ namespace NinjaTraderAddOnProject
                     txtDestFolder.Text = dialog.SelectedPath;
             };
             batchPanel.Children.Add(destGrid);
+
+            Grid rollingDateGrid = new Grid { Margin = new Thickness(0, 6, 0, 0) };
+            rollingDateGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+            rollingDateGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+            rollingDateGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+
+            chkRollingDateRange = new CheckBox
+            {
+                Content = "Use last",
+                Foreground = Brushes.White,
+                FontSize = 11,
+                VerticalAlignment = VerticalAlignment.Center
+            };
+            chkRollingDateRange.Checked += (s, e) => txtRollingDays.IsEnabled = true;
+            chkRollingDateRange.Unchecked += (s, e) => txtRollingDays.IsEnabled = false;
+            rollingDateGrid.Children.Add(chkRollingDateRange);
+
+            txtRollingDays = new TextBox
+            {
+                Text = "30",
+                Width = 42,
+                IsEnabled = false,
+                FontSize = 10,
+                Margin = new Thickness(5, 0, 4, 0),
+                Background = new SolidColorBrush(Color.FromRgb(45, 45, 45)),
+                Foreground = Brushes.White,
+                BorderBrush = Brushes.Gray,
+                HorizontalContentAlignment = HorizontalAlignment.Right
+            };
+            Grid.SetColumn(txtRollingDays, 1);
+            rollingDateGrid.Children.Add(txtRollingDays);
+
+            rollingDateGrid.Children.Add(new TextBlock
+            {
+                Text = "days",
+                FontSize = 10,
+                Foreground = Brushes.Silver,
+                VerticalAlignment = VerticalAlignment.Center
+            });
+            Grid.SetColumn(rollingDateGrid.Children[2], 2);
+            batchPanel.Children.Add(rollingDateGrid);
+
+            chkCloseTempTabs = new CheckBox
+            {
+                Content = "Close temporary tabs after each run",
+                IsChecked = true,
+                Foreground = Brushes.White,
+                FontSize = 11,
+                Margin = new Thickness(0, 6, 0, 0)
+            };
+            batchPanel.Children.Add(chkCloseTempTabs);
+
+            chkOverwriteOutput = new CheckBox
+            {
+                Content = "Overwrite existing output",
+                IsChecked = true,
+                Foreground = Brushes.White,
+                FontSize = 11,
+                Margin = new Thickness(0, 2, 0, 0)
+            };
+            batchPanel.Children.Add(chkOverwriteOutput);
 
             Grid actionGrid = new Grid { Margin = new Thickness(0, 10, 0, 5) };
             actionGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
@@ -325,6 +419,7 @@ namespace NinjaTraderAddOnProject
                 commandWatcher.NotifyFilter = NotifyFilters.LastWrite | NotifyFilters.CreationTime | NotifyFilters.Size;
                 commandWatcher.Changed += OnCommandFileChanged;
                 commandWatcher.Created += OnCommandFileChanged;
+                commandWatcher.Renamed += OnCommandFileChanged;
                 commandWatcher.EnableRaisingEvents = true;
                 Log("IPC watcher ready at C:\\temp\\nt8_command.json.");
             }
@@ -347,6 +442,12 @@ namespace NinjaTraderAddOnProject
 
                     string sourceFolder = ExtractJsonString(json, "sourceFolder");
                     string destFolder = ExtractJsonString(json, "destFolder");
+                    string runId = ExtractJsonString(json, "runId");
+                    string instrument = ExtractJsonString(json, "instrument");
+
+                    if (!string.IsNullOrWhiteSpace(runId))
+                        currentRunId = runId;
+                    requestedInstrument = string.IsNullOrWhiteSpace(instrument) ? null : instrument;
 
                     _ = Dispatcher.BeginInvoke(new Action(() =>
                     {
@@ -372,88 +473,311 @@ namespace NinjaTraderAddOnProject
             return match.Success ? match.Groups["value"].Value.Replace("\\\\", "\\").Replace("\\\"", "\"") : null;
         }
 
+        // ------------------------------------------------------------------
+        // Status heartbeat: writes C:\temp\nt8_status.json for TA Foundation.
+        // ------------------------------------------------------------------
+        private void WriteStatus(string state)
+        {
+            try
+            {
+                StringBuilder sb = new StringBuilder();
+                sb.Append("{");
+                sb.Append("\"runId\":").Append(EncodeJsonString(currentRunId)).Append(",");
+                sb.Append("\"state\":").Append(EncodeJsonString(state)).Append(",");
+                sb.Append("\"currentTemplate\":").Append(EncodeJsonString(currentTemplateName)).Append(",");
+                sb.Append("\"completed\":").Append(currentCompletedCount.ToString(CultureInfo.InvariantCulture)).Append(",");
+                sb.Append("\"total\":").Append(currentTotalCount.ToString(CultureInfo.InvariantCulture)).Append(",");
+                sb.Append("\"lastError\":").Append(EncodeJsonString(lastErrorMessage)).Append(",");
+                sb.Append("\"heartbeatUtc\":").Append(EncodeJsonString(DateTime.UtcNow.ToString("o", CultureInfo.InvariantCulture))).Append(",");
+                sb.Append("\"outputRoot\":").Append(EncodeJsonString(currentDestFolder));
+                sb.Append("}");
+
+                string tempDir = Path.GetDirectoryName(StatusFilePath);
+                if (!Directory.Exists(tempDir))
+                    Directory.CreateDirectory(tempDir);
+
+                // Atomic write: write a sibling temp file then replace.
+                string tmpPath = StatusFilePath + ".tmp";
+                File.WriteAllText(tmpPath, sb.ToString(), new UTF8Encoding(false));
+                try
+                {
+                    if (File.Exists(StatusFilePath))
+                        File.Replace(tmpPath, StatusFilePath, null);
+                    else
+                        File.Move(tmpPath, StatusFilePath);
+                }
+                catch (IOException)
+                {
+                    // Reader may have the file open; fall back to plain copy.
+                    File.Copy(tmpPath, StatusFilePath, true);
+                    try { File.Delete(tmpPath); } catch { }
+                }
+            }
+            catch (Exception ex)
+            {
+                // Status writing is best-effort; never break the batch over it.
+                try { Log("WriteStatus error: " + ex.Message); } catch { }
+            }
+        }
+
+        private static string EncodeJsonString(string s)
+        {
+            if (s == null) return "null";
+            StringBuilder sb = new StringBuilder("\"");
+            foreach (char c in s)
+            {
+                switch (c)
+                {
+                    case '"':  sb.Append("\\\""); break;
+                    case '\\': sb.Append("\\\\"); break;
+                    case '\n': sb.Append("\\n"); break;
+                    case '\r': sb.Append("\\r"); break;
+                    case '\t': sb.Append("\\t"); break;
+                    default:
+                        if (c < ' ') sb.Append("\\u").Append(((int)c).ToString("x4", CultureInfo.InvariantCulture));
+                        else sb.Append(c);
+                        break;
+                }
+            }
+            sb.Append('"');
+            return sb.ToString();
+        }
+
         private async Task RunBatch()
         {
             string sourceFolder = string.Empty;
             string destFolder = string.Empty;
+            bool useRollingDateRange = false;
+            bool closeTempTabs = true;
+            bool overwriteOutput = true;
+            int rollingDays = 0;
             Dispatcher.Invoke(() =>
             {
                 sourceFolder = txtSourceFolder.Text;
                 destFolder = txtDestFolder.Text;
+                useRollingDateRange = chkRollingDateRange.IsChecked == true;
+                closeTempTabs = chkCloseTempTabs.IsChecked == true;
+                overwriteOutput = chkOverwriteOutput.IsChecked == true;
+                if (useRollingDateRange)
+                    int.TryParse(txtRollingDays.Text, NumberStyles.Integer, CultureInfo.InvariantCulture, out rollingDays);
             });
 
             if (!Directory.Exists(sourceFolder)) { Log("Invalid source folder."); return; }
-            if (!Directory.Exists(destFolder)) { Log("Invalid destination folder."); return; }
+            if (string.IsNullOrWhiteSpace(destFolder)) { Log("Invalid destination folder."); return; }
+            if (useRollingDateRange && rollingDays <= 0) { Log("Invalid rolling backtest days."); return; }
 
-            var templates = Directory.GetFiles(sourceFolder, "*.xml").ToList();
-            if (templates.Count == 0) { Log("No .xml templates found."); return; }
+            try
+            {
+                Directory.CreateDirectory(destFolder);
+            }
+            catch (Exception ex)
+            {
+                Log("Could not create destination folder: " + Unwrap(ex));
+                return;
+            }
+
+            var templates = Directory.GetFiles(sourceFolder, "*.xml", SearchOption.AllDirectories).OrderBy(path => path, StringComparer.OrdinalIgnoreCase).ToList();
+            if (templates.Count == 0) { Log("No .xml templates found in source folder or subfolders."); return; }
+
+            // Was the contract explicitly supplied via the IPC payload?
+            // If yes, we use it to override every template's instrument
+            // (operators sometimes want to run the same templates against
+            // a different instrument). If no, the template's own
+            // <InstrumentOrInstrumentList> wins — clobbering it with the
+            // currently-selected tab's instrument has caused silent
+            // contract drops where e.g. an `NQ 06-26` template was loaded
+            // as `NQ`, producing zero trades.
+            bool instrumentExplicit = !string.IsNullOrWhiteSpace(requestedInstrument);
+            string selectedInstrument = instrumentExplicit
+                ? requestedInstrument
+                : GetSelectedInstrumentForBatch();
+            if (string.IsNullOrWhiteSpace(selectedInstrument))
+            {
+                ShowBatchWarning("Please select an instrument in the Strategy Analyzer before starting the batch.");
+                Log("Batch not started: select an instrument in the Strategy Analyzer first.");
+                return;
+            }
+            Log("Batch instrument source: " + (instrumentExplicit ? "IPC payload" : "current tab")
+                + " (" + selectedInstrument + ")."
+                + (instrumentExplicit ? " Templates will be forced to this instrument." : " Templates' <InstrumentOrInstrumentList> values will be preserved."));
+
+            var summaryRecords = new List<BatchRunRecord>();
+            string batchSummaryPath = Path.Combine(destFolder, "BatchRunSummary.csv");
+            WriteBatchRunSummaryCsv(batchSummaryPath, summaryRecords);
+            DateTime rollingTo = DateTime.Today;
+            DateTime rollingFrom = rollingTo.AddDays(-rollingDays);
 
             Log("Starting batch with " + templates.Count + " templates.");
+            if (useRollingDateRange)
+                Log("Rolling date range enabled: " + rollingFrom.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture) + " to " + rollingTo.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture) + ".");
+
+            currentDestFolder = destFolder;
+            currentTotalCount = templates.Count;
+            currentCompletedCount = 0;
+            currentTemplateName = null;
+            lastErrorMessage = null;
+            WriteStatus("starting");
+
             foreach (string path in templates)
             {
                 if (!isRunning || cancelRequested) break;
 
                 string templateName = Path.GetFileNameWithoutExtension(path);
-                XElement element = XElement.Load(path);
+                currentTemplateName = templateName;
+                WriteStatus("running");
+                string outputName = GetSafeOutputName(templateName, summaryRecords.Count + 1, destFolder);
+                XElement element = null;
                 int resultCountBeforeRun = 0;
                 string originalInstrument = string.Empty;
                 object batchTab = null;
+                var record = new BatchRunRecord
+                {
+                    TemplateName = templateName,
+                    Status = "Started",
+                    RunStartTime = DateTime.Now,
+                    OutputFolder = Path.Combine(destFolder, outputName)
+                };
+                summaryRecords.Add(record);
+                WriteBatchRunSummaryCsv(batchSummaryPath, summaryRecords);
+
+                try
+                {
+                    element = XElement.Load(path);
+                }
+                catch (Exception ex)
+                {
+                    record.Status = "TemplateLoadError";
+                    record.Error = Unwrap(ex);
+                    record.RunEndTime = DateTime.Now;
+                    Log("Template load error: " + record.Error);
+                    lastErrorMessage = "TemplateLoadError: " + record.Error;
+                    WriteStatus("running");
+                    WriteBatchRunSummaryCsv(batchSummaryPath, summaryRecords);
+                    continue;
+                }
+
+                if (useRollingDateRange)
+                    ApplyRollingBacktestDates(element, rollingFrom, rollingTo);
+                PopulateBatchRunRecordBacktestDates(record, element);
 
                 Log("Processing in new tab: " + templateName);
                 Dispatcher.Invoke(() =>
                 {
                     try
                     {
-                        originalInstrument = StrategyAnalyzerAutomation.GetSelectedInstrumentOrInstrumentList(saWindow);
+                        originalInstrument = selectedInstrument;
                         batchTab = StrategyAnalyzerAutomation.AddNewTab(saWindow);
                         currentBatchTab = batchTab;
                         StrategyAnalyzerAutomation.LoadTemplate(saWindow, element);
-                        StrategyAnalyzerAutomation.SetSelectedInstrumentOrInstrumentList(saWindow, originalInstrument);
+                        // Only override the loaded template's instrument when
+                        // the IPC payload explicitly requested one. Otherwise
+                        // trust whatever <InstrumentOrInstrumentList> the
+                        // template carried (LoadTemplate already applied it).
+                        if (instrumentExplicit)
+                        {
+                            StrategyAnalyzerAutomation.SetSelectedInstrumentOrInstrumentList(saWindow, originalInstrument);
+                        }
                         Log("Loaded template state: " + StrategyAnalyzerAutomation.GetSelectedTemplateDebug(saWindow));
                         resultCountBeforeRun = StrategyAnalyzerAutomation.GetSelectedResultCount(saWindow);
                     }
                     catch (Exception ex)
                     {
-                        Log("Setup error: " + Unwrap(ex));
+                        record.Status = "SetupError";
+                        record.Error = Unwrap(ex);
+                        record.RunEndTime = DateTime.Now;
+                        Log("Setup error: " + record.Error);
                     }
                 });
+
+                if (record.Status == "SetupError")
+                {
+                    lastErrorMessage = "SetupError: " + record.Error;
+                    WriteStatus("running");
+                    CloseBatchTabIfEnabled(batchTab, closeTempTabs);
+                    WriteBatchRunSummaryCsv(batchSummaryPath, summaryRecords);
+                    continue;
+                }
 
                 // Small delay to allow UI to settle after template load
                 await Task.Delay(1000);
                 if (cancelRequested)
+                {
+                    record.Status = "Cancelled";
+                    record.RunEndTime = DateTime.Now;
+                    WriteBatchRunSummaryCsv(batchSummaryPath, summaryRecords);
                     break;
+                }
 
                 Dispatcher.Invoke(() =>
                 {
                     try
                     {
                         StrategyAnalyzerAutomation.Run(saWindow);
+                        record.Status = "Running";
                     }
                     catch (Exception ex)
                     {
-                        Log("Run error: " + Unwrap(ex));
+                        record.Status = "RunError";
+                        record.Error = Unwrap(ex);
+                        record.RunEndTime = DateTime.Now;
+                        Log("Run error: " + record.Error);
                     }
                 });
+
+                if (record.Status == "RunError")
+                {
+                    lastErrorMessage = "RunError: " + record.Error;
+                    WriteStatus("running");
+                    CloseBatchTabIfEnabled(batchTab, closeTempTabs);
+                    WriteBatchRunSummaryCsv(batchSummaryPath, summaryRecords);
+                    continue;
+                }
 
                 Log("Running backtest...");
                 bool completed = await WaitForRunCompletion(resultCountBeforeRun, TimeSpan.FromMinutes(10));
                 if (cancelRequested)
                 {
+                    record.Status = "Cancelled";
+                    record.RunEndTime = DateTime.Now;
                     CloseBatchTab(batchTab);
+                    WriteBatchRunSummaryCsv(batchSummaryPath, summaryRecords);
                     break;
                 }
 
                 if (!completed)
+                {
+                    record.Status = "TimedOut";
                     Log("Timed out waiting for results; exporting whatever is available.");
+                }
 
-                ExportResults(templateName, destFolder);
-                CloseBatchTab(batchTab);
+                bool exported = ExportResults(templateName, outputName, destFolder, record, overwriteOutput);
+                if (exported && record.Status != "TimedOut")
+                    record.Status = "Completed";
+                else if (!exported && record.Status != "TimedOut")
+                {
+                    record.Status = "ExportError";
+                    lastErrorMessage = "ExportError on " + templateName;
+                }
+
+                record.RunEndTime = DateTime.Now;
+                WriteBatchRunSummaryCsv(batchSummaryPath, summaryRecords);
+                CloseBatchTabIfEnabled(batchTab, closeTempTabs);
+
+                currentCompletedCount++;
+                WriteStatus("running");
             }
 
+            currentTemplateName = null;
             if (cancelRequested)
+            {
                 Log("Batch cancelled.");
+                WriteStatus("cancelled");
+            }
             else
+            {
                 Log("Batch completed.");
+                WriteStatus("finished");
+            }
         }
 
         private async Task<bool> WaitForRunCompletion(int resultCountBeforeRun, TimeSpan timeout)
@@ -504,6 +828,8 @@ namespace NinjaTraderAddOnProject
                 elapsedSeconds++;
                 if (elapsedSeconds % 10 == 0)
                     Log("Waiting for run: results=" + currentCount.ToString(CultureInfo.InvariantCulture) + ", busy=" + busy.ToString(CultureInfo.InvariantCulture) + ".");
+                if (elapsedSeconds % 2 == 0)
+                    WriteStatus("running");
                 await Task.Delay(1000);
             }
             return false;
@@ -529,22 +855,50 @@ namespace NinjaTraderAddOnProject
             });
         }
 
-        private void ExportResults(string templateName, string destFolder)
+        private void CloseBatchTabIfEnabled(object tab, bool closeTempTabs)
         {
+            if (closeTempTabs)
+                CloseBatchTab(tab);
+        }
+
+        private string GetSelectedInstrumentForBatch()
+        {
+            string instrument = string.Empty;
             Dispatcher.Invoke(() =>
             {
                 try
                 {
-                    string subFolder = Path.Combine(destFolder, templateName);
-                    if (Directory.Exists(subFolder))
-                    {
-                        foreach (string existingFile in Directory.GetFiles(subFolder, "*.csv"))
-                            File.Delete(existingFile);
-                    }
-                    else
+                    instrument = StrategyAnalyzerAutomation.GetSelectedInstrumentOrInstrumentList(saWindow);
+                }
+                catch (Exception ex)
+                {
+                    Log("Instrument check error: " + Unwrap(ex));
+                }
+            });
+            return instrument;
+        }
+
+        private void ShowBatchWarning(string message)
+        {
+            Dispatcher.BeginInvoke(new Action(() =>
+            {
+                MessageBox.Show(Window.GetWindow(this), message, "Batch Strategy Analyzer", MessageBoxButton.OK, MessageBoxImage.Warning);
+            }));
+        }
+
+        private bool ExportResults(string templateName, string outputName, string destFolder, BatchRunRecord record, bool overwriteOutput)
+        {
+            bool exported = false;
+            Dispatcher.Invoke(() =>
+            {
+                try
+                {
+                    string subFolder = Path.Combine(destFolder, outputName);
+                    if (!Directory.Exists(subFolder))
                         Directory.CreateDirectory(subFolder);
 
                     List<object> results = StrategyAnalyzerAutomation.GetSelectedResults(saWindow).ToList();
+                    PopulateBatchRunRecord(record, results, subFolder);
 
                     string settingsPath = Path.Combine(subFolder, "Settings.csv");
                     string summaryPath = Path.Combine(subFolder, "Summary.csv");
@@ -552,6 +906,26 @@ namespace NinjaTraderAddOnProject
                     string ordersPath = Path.Combine(subFolder, "Orders.csv");
                     string executionsPath = Path.Combine(subFolder, "Executions.csv");
                     string analysisPath = Path.Combine(subFolder, "Analysis.csv");
+                    string optimizationPath = Path.Combine(subFolder, outputName + "_Optimization.csv");
+                    var outputFiles = new[] { settingsPath, summaryPath, tradesPath, ordersPath, executionsPath, analysisPath, optimizationPath };
+
+                    if (!overwriteOutput)
+                    {
+                        List<string> existingOutputs = outputFiles.Where(File.Exists).Select(Path.GetFileName).ToList();
+                        if (existingOutputs.Count > 0)
+                        {
+                            string message = "Output exists and overwrite is disabled: " + string.Join(", ", existingOutputs);
+                            if (record != null)
+                                record.Error = message;
+                            Log(message);
+                            return;
+                        }
+                    }
+                    else
+                    {
+                        foreach (string existingFile in Directory.GetFiles(subFolder, "*.csv"))
+                            File.Delete(existingFile);
+                    }
 
                     WriteSettingsCsv(settingsPath, results);
                     WriteSummaryCsv(summaryPath, results);
@@ -559,14 +933,126 @@ namespace NinjaTraderAddOnProject
                     WriteOrdersCsv(ordersPath, results);
                     WriteExecutionsCsv(executionsPath, results);
                     WriteAnalysisCsv(analysisPath, results);
+                    WriteOptimizationCsv(optimizationPath, results);
 
-                    Log("Exported 6 internal CSV files to " + subFolder);
+                    Log("Exported 7 internal CSV files to " + subFolder);
+                    exported = true;
                 }
                 catch (Exception ex)
                 {
-                    Log("Export logic error: " + Unwrap(ex));
+                    string message = Unwrap(ex);
+                    if (record != null)
+                        record.Error = message;
+                    Log("Export logic error: " + message);
                 }
             });
+            return exported;
+        }
+
+        private void PopulateBatchRunRecord(BatchRunRecord record, List<object> results, string outputFolder)
+        {
+            if (record == null)
+                return;
+
+            record.OutputFolder = outputFolder;
+            object result = results.FirstOrDefault();
+            if (result == null)
+                return;
+
+            object summary = GetProperty(result, "SummaryPerformancesCurrency") ?? GetProperty(result, "SummaryPerformances");
+            object all = GetProperty(summary, "All");
+
+            record.Strategy = Convert.ToString(GetProperty(result, "StrategyName"), CultureInfo.InvariantCulture);
+            record.Instrument = Convert.ToString(GetProperty(result, "Instrument"), CultureInfo.InvariantCulture);
+            record.TotalNetProfit = FormatCurrency(GetProperty(all, "TotalNetProfit"));
+            record.Trades = FormatInteger(GetProperty(all, "TotalNumTrades"));
+            record.ProfitFactor = FormatNumber(GetProperty(all, "ProfitFactor"));
+            record.MaxDrawdown = FormatCurrency(GetProperty(all, "MaxDrawdown"));
+            record.BacktestStart = FormatSummaryDate(GetProperty(result, "From"));
+            record.BacktestEnd = FormatSummaryDate(GetProperty(result, "To"));
+        }
+
+        private void WriteBatchRunSummaryCsv(string fileName, List<BatchRunRecord> records)
+        {
+            var sb = new StringBuilder();
+            sb.AppendLine("Template,Status,Strategy,Instrument,Backtest start,Backtest end,Total net profit,Trades,Profit factor,Max drawdown,Run start time,Run end time,Output folder,Error");
+
+            foreach (BatchRunRecord record in records)
+            {
+                sb.AppendLine(string.Join(",", new[]
+                {
+                    record.TemplateName,
+                    record.Status,
+                    record.Strategy,
+                    record.Instrument,
+                    record.BacktestStart,
+                    record.BacktestEnd,
+                    record.TotalNetProfit,
+                    record.Trades,
+                    record.ProfitFactor,
+                    record.MaxDrawdown,
+                    FormatSummaryDateTime(record.RunStartTime),
+                    record.RunEndTime.HasValue ? FormatSummaryDateTime(record.RunEndTime.Value) : string.Empty,
+                    record.OutputFolder,
+                    record.Error
+                }.Select(EscapeCsv)));
+            }
+
+            File.WriteAllText(fileName, sb.ToString(), Encoding.UTF8);
+        }
+
+        private void PopulateBatchRunRecordBacktestDates(BatchRunRecord record, XElement templateElement)
+        {
+            XElement strategyElement = templateElement?.Element("Strategy")?.Elements().FirstOrDefault();
+            if (record == null || strategyElement == null)
+                return;
+
+            record.BacktestStart = FormatSummaryDate(ParseTemplateDate(strategyElement.Elements().FirstOrDefault(element => element.Name.LocalName == "From")?.Value));
+            record.BacktestEnd = FormatSummaryDate(ParseTemplateDate(strategyElement.Elements().FirstOrDefault(element => element.Name.LocalName == "To")?.Value));
+        }
+
+        private string GetSafeOutputName(string templateName, int index, string destFolder)
+        {
+            string safe = Regex.Replace(templateName ?? "Template", "[^A-Za-z0-9_.-]+", "_").Trim('_');
+            string hash = Math.Abs((safe ?? string.Empty).GetHashCode()).ToString("x", CultureInfo.InvariantCulture);
+            int pathBudget = 240
+                - (destFolder ?? string.Empty).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar).Length
+                - "_Optimization.csv".Length
+                - 2; // subfolder separator plus file separator; output name appears in both path segments.
+            int maxNameLength = Math.Max(16, Math.Min(72, pathBudget / 2));
+
+            if (safe.Length > maxNameLength)
+            {
+                string suffix = "_" + index.ToString("0000", CultureInfo.InvariantCulture) + "_" + hash;
+                int prefixLength = Math.Max(1, maxNameLength - suffix.Length);
+                safe = safe.Substring(0, Math.Min(prefixLength, safe.Length)).TrimEnd('_', '-', '.') + suffix;
+                if (safe.Length > maxNameLength)
+                    safe = safe.Substring(safe.Length - maxNameLength);
+            }
+
+            return string.IsNullOrWhiteSpace(safe) ? "Template_" + index.ToString("0000", CultureInfo.InvariantCulture) : safe;
+        }
+
+        private void ApplyRollingBacktestDates(XElement templateElement, DateTime from, DateTime to)
+        {
+            XElement strategyElement = templateElement?.Element("Strategy")?.Elements().FirstOrDefault();
+            if (strategyElement == null)
+                return;
+
+            SetSimpleChildValue(strategyElement, "From", FormatTemplateDate(from));
+            SetSimpleChildValue(strategyElement, "To", FormatTemplateDate(to));
+        }
+
+        private void SetSimpleChildValue(XElement parent, string localName, string value)
+        {
+            XElement child = parent.Elements().FirstOrDefault(element => element.Name.LocalName == localName);
+            if (child == null)
+            {
+                child = new XElement(parent.Name.Namespace + localName);
+                parent.Add(child);
+            }
+
+            child.Value = value;
         }
 
         private void WriteSettingsCsv(string fileName, List<object> results)
@@ -818,6 +1304,38 @@ namespace NinjaTraderAddOnProject
             File.WriteAllText(fileName, sb.ToString(), Encoding.UTF8);
         }
 
+        private void WriteOptimizationCsv(string fileName, List<object> results)
+        {
+            var sb = new StringBuilder();
+            sb.AppendLine("Instrument,Performance,Parameters,Total net profit,Gross profit,Gross loss,Profit factor,Max. drawdown,Total # of trades,Percent profitable,");
+
+            bool wroteInstrument = false;
+            foreach (object result in results)
+            {
+                object summary = GetProperty(result, "SummaryPerformancesCurrency") ?? GetProperty(result, "SummaryPerformances");
+                object all = GetProperty(summary, "All");
+                string instrument = wroteInstrument ? string.Empty : FormatInstrumentName(GetProperty(result, "Instrument"));
+                wroteInstrument = true;
+
+                sb.AppendLine(string.Join(",", new[]
+                {
+                    instrument,
+                    FormatOptimizationNumber(GetOptimizationPerformance(result, all)),
+                    FormatOptimizationParameters(GetProperty(result, "ParametersString")),
+                    FormatOptimizationNumber(GetProperty(all, "TotalNetProfit")),
+                    FormatOptimizationNumber(GetProperty(all, "GrossProfit")),
+                    FormatOptimizationNumber(GetProperty(all, "GrossLoss")),
+                    FormatOptimizationNumber(GetProperty(all, "ProfitFactor")),
+                    FormatOptimizationNumber(GetProperty(all, "MaxDrawdown")),
+                    FormatInteger(GetProperty(all, "TotalNumTrades")),
+                    FormatOptimizationPercent(GetProperty(all, "PercentProfitable")),
+                    string.Empty
+                }.Select(EscapeCsv)));
+            }
+
+            File.WriteAllText(fileName, sb.ToString(), Encoding.UTF8);
+        }
+
         private enum MetricFormat
         {
             Currency,
@@ -942,6 +1460,35 @@ namespace NinjaTraderAddOnProject
             return string.Empty;
         }
 
+        private string FormatSummaryDateTime(DateTime value)
+        {
+            return value.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture);
+        }
+
+        private string FormatSummaryDate(object value)
+        {
+            if (value is DateTime dt)
+                return dt.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture);
+
+            return Convert.ToString(value, CultureInfo.InvariantCulture);
+        }
+
+        private DateTime? ParseTemplateDate(string value)
+        {
+            if (string.IsNullOrWhiteSpace(value))
+                return null;
+
+            if (DateTime.TryParse(value, CultureInfo.InvariantCulture, DateTimeStyles.None, out DateTime date))
+                return date;
+
+            return null;
+        }
+
+        private string FormatTemplateDate(DateTime value)
+        {
+            return value.Date.ToString("yyyy-MM-dd'T'00:00:00", CultureInfo.InvariantCulture);
+        }
+
         private string FormatPrice(object value)
         {
             return GetDouble(value).ToString("0.00", CultureInfo.InvariantCulture);
@@ -963,6 +1510,70 @@ namespace NinjaTraderAddOnProject
         {
             double number = GetDouble(value);
             return number.ToString("0.00", CultureInfo.InvariantCulture);
+        }
+
+        private string FormatOptimizationNumber(object value)
+        {
+            return GetDouble(value).ToString("0.###############", CultureInfo.InvariantCulture);
+        }
+
+        private string FormatOptimizationPercent(object value)
+        {
+            double number = GetDouble(value);
+            if (number > 0 && number <= 1)
+                number *= 100;
+            return number.ToString("0.###############", CultureInfo.InvariantCulture) + "%";
+        }
+
+        private string FormatOptimizationParameters(object value)
+        {
+            string text = Convert.ToString(value, CultureInfo.InvariantCulture);
+            if (string.IsNullOrWhiteSpace(text))
+                return string.Empty;
+
+            int close = text.LastIndexOf(')');
+            int open = FindMatchingOpenParen(text, close);
+            if (open < 0 || close <= open)
+                return text;
+
+            string values = text.Substring(0, open).TrimEnd();
+            string names = text.Substring(open + 1, close - open - 1)
+                .Replace(",", " ")
+                .Trim();
+            names = Regex.Replace(names, "_\\s+\\(", "_(");
+            names = Regex.Replace(names, "\\s+", " ");
+            return values + " (" + names + " )";
+        }
+
+        private int FindMatchingOpenParen(string text, int closeIndex)
+        {
+            if (string.IsNullOrEmpty(text) || closeIndex < 0 || closeIndex >= text.Length)
+                return -1;
+
+            int depth = 1;
+            for (int i = closeIndex - 1; i >= 0; i--)
+            {
+                if (text[i] == ')')
+                    depth++;
+                else if (text[i] == '(')
+                {
+                    depth--;
+                    if (depth == 0)
+                        return i;
+                }
+            }
+
+            return -1;
+        }
+
+        private object GetOptimizationPerformance(object result, object all)
+        {
+            object value = GetProperty(result, "Performance")
+                ?? GetProperty(result, "FitnessValue")
+                ?? GetProperty(result, "OptimizationFitnessValue")
+                ?? GetProperty(result, "Value");
+
+            return value ?? GetProperty(all, "ProfitFactor");
         }
 
         private string FormatInteger(object value)
