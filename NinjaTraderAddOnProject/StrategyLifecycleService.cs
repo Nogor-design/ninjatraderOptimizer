@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
 using System.Linq;
+using System.Reflection;
 using System.Text;
 using System.Text.RegularExpressions;
 using System.Threading.Tasks;
@@ -231,6 +232,37 @@ namespace NinjaTraderAddOnProject
                     transitions.Append(" -> category:").Append(strategy.Category)
                                .Append(" ws:").Append(strategy.Workspace ?? "null");
 
+                    // Iteration 4: NinjaScriptBase.Dispatcher { get; internal set; } is
+                    // NULL on an Activator-created instance — NT's hosts assign one
+                    // (Globals.RandomDispatcher spreads scripts over worker threads)
+                    // before driving states. A null script dispatcher is the leading
+                    // suspect for SetState(Active) silently no-opping in iterations
+                    // 1-3. Assign it via reflection (internal setter), and hook the
+                    // internal AfterSetState callback so the engine's own pump becomes
+                    // observable in this log.
+                    try
+                    {
+                        PropertyInfo dispProp = typeof(NinjaScriptBase).GetProperty("Dispatcher");
+                        bool wasNull = dispProp != null && dispProp.GetValue(strategy) == null;
+                        if (dispProp != null)
+                            dispProp.GetSetMethod(true).Invoke(strategy, new object[] { NinjaTrader.Core.Globals.RandomDispatcher });
+                        transitions.Append(" -> dispatcher:").Append(wasNull ? "assigned(wasNull)" : "assigned(wasSet)");
+
+                        PropertyInfo afterProp = typeof(NinjaScriptBase).GetProperty(
+                            "AfterSetState", BindingFlags.NonPublic | BindingFlags.Instance);
+                        if (afterProp != null)
+                        {
+                            StrategyBase captured = strategy;
+                            Action hook = () => SafeLog(log, "EnableStrategy AfterSetState fired -> " + captured.State);
+                            afterProp.GetSetMethod(true).Invoke(strategy, new object[] { hook });
+                            transitions.Append(" afterHook:set");
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        transitions.Append(" -> dispatcher:EX(").Append(ex.Message).Append(")");
+                    }
+
                     string instrumentName = strategy.InstrumentOrInstrumentList;
                     if (!string.IsNullOrWhiteSpace(instrumentName))
                     {
@@ -257,22 +289,38 @@ namespace NinjaTraderAddOnProject
                 return;
             }
 
-            // Paced Active attempts in SEPARATE dispatcher frames: SetState ignores
-            // re-entrant/back-to-back calls ("multiple calls ignored" per setstate.md),
-            // so give the engine a frame + a second between attempts.
+            // Iteration 5 probe: did OnStateChange(Configure) actually run? The
+            // private doneConfigureState flag is the engine's own record of that.
+            await onUi(() =>
+            {
+                try
+                {
+                    FieldInfo f = typeof(NinjaScriptBase).GetField("doneConfigureState",
+                        BindingFlags.NonPublic | BindingFlags.Instance);
+                    transitions.Append(" doneConfigure:")
+                        .Append(f != null ? f.GetValue(strategy).ToString() : "field?");
+                }
+                catch (Exception ex) { transitions.Append(" doneConfigure:EX(").Append(ex.Message).Append(")"); }
+            });
+
+            // Paced Active attempts — iteration 5 runs them on the STRATEGY'S OWN
+            // dispatcher (scripts are dispatcher-affine; iterations 1-4 used the main
+            // UI dispatcher and were silently refused).
             for (int attempt = 1; attempt <= 3 && walkError == null; attempt++)
             {
                 bool done = false;
-                await onUi(() =>
+                System.Windows.Threading.Dispatcher stratDisp = strategy.Dispatcher
+                    ?? System.Windows.Application.Current.Dispatcher;
+                await stratDisp.InvokeAsync(new Action(() =>
                 {
                     try
                     {
                         if (strategy.State != State.Configure) { done = true; return; }
                         strategy.SetState(State.Active);
-                        transitions.Append(" -> active").Append(attempt).Append(":").Append(strategy.State);
+                        transitions.Append(" -> active").Append(attempt).Append("@own:").Append(strategy.State);
                     }
                     catch (Exception ex) { walkError = ex; }
-                });
+                })).Task;
                 if (done)
                     break;
                 await Task.Delay(1000);
