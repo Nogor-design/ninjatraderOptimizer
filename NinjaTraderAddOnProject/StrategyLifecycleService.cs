@@ -203,6 +203,34 @@ namespace NinjaTraderAddOnProject
 
                     strategy.SetState(State.Active);
                     transitions.Append(" -> active:").Append(strategy.State);
+
+                    // Iteration 2 (first run stalled at Configure; SetState(Active)
+                    // was silently refused): register with the account's strategy
+                    // collection — the binding NT's own Strategies grid maintains —
+                    // then retry the forward states, escalating one at a time. Every
+                    // attempt is logged; whichever rung moves the state is the answer
+                    // the experiment exists to find.
+                    if (strategy.State == State.Configure)
+                    {
+                        try
+                        {
+                            if (!account.Strategies.Contains(strategy))
+                                account.Strategies.Add(strategy);
+                            transitions.Append(" -> acctAdd:").Append(strategy.State);
+                        }
+                        catch (Exception ex)
+                        {
+                            transitions.Append(" -> acctAdd:EX(").Append(ex.Message).Append(")");
+                        }
+
+                        strategy.SetState(State.Active);
+                        transitions.Append(" -> active2:").Append(strategy.State);
+                    }
+                    if (strategy.State == State.Configure)
+                    {
+                        strategy.SetState(State.DataLoaded);
+                        transitions.Append(" -> dataloaded:").Append(strategy.State);
+                    }
                 }
                 catch (Exception ex)
                 {
