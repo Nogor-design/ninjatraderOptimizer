@@ -86,40 +86,72 @@ namespace NinjaTraderAddOnProject
             string requestedName = ExtractJsonString(json, "connectionName");
             int timeoutSeconds = Math.Max(10, ExtractJsonInt(json, "timeoutSeconds", 90));
 
-            if (Connection.PlaybackConnection != null)
+            // ALL Connection/Globals access on the UI dispatcher — from a worker
+            // thread these trip NT-internal Debug.Assert dialogs that block the
+            // whole IPC pipeline (live-observed 2026-06-12).
+            Func<Action, Task> onUi = action => System.Windows.Application.Current.Dispatcher.InvokeAsync(action).Task;
+
+            bool already = false;
+            string connectError = null;
+            await onUi(() =>
             {
-                SafeLog(log, "ConnectPlayback: playback connection already up (" + Connection.PlaybackConnection.Options.Name + ").");
-                WriteStatus(runId, "finished", null, "already_connected:" + Connection.PlaybackConnection.Options.Name);
+                try
+                {
+                    if (Connection.PlaybackConnection != null)
+                    {
+                        already = true;
+                        return;
+                    }
+                    ConnectOptions options = NinjaTrader.Core.Globals.ConnectOptions
+                        .FirstOrDefault(o => !string.IsNullOrEmpty(requestedName)
+                            ? string.Equals(o.Name, requestedName, StringComparison.OrdinalIgnoreCase)
+                            : (o.Name ?? "").IndexOf("Playback", StringComparison.OrdinalIgnoreCase) >= 0);
+                    if (options == null)
+                    {
+                        connectError = "no playback connection configured (known: "
+                            + string.Join(" | ", NinjaTrader.Core.Globals.ConnectOptions.Select(o => o.Name)) + ")";
+                        return;
+                    }
+                    SafeLog(log, "ConnectPlayback: connecting '" + options.Name + "'...");
+                    WriteStatus(runId, "running", null, "connecting:" + options.Name);
+                    Connection.Connect(options);
+                }
+                catch (Exception ex)
+                {
+                    connectError = ex.Message;
+                }
+            });
+            if (already)
+            {
+                SafeLog(log, "ConnectPlayback: playback connection already up.");
+                WriteStatus(runId, "finished", null, "already_connected");
                 return;
             }
-
-            ConnectOptions options = NinjaTrader.Core.Globals.ConnectOptions
-                .FirstOrDefault(o => !string.IsNullOrEmpty(requestedName)
-                    ? string.Equals(o.Name, requestedName, StringComparison.OrdinalIgnoreCase)
-                    : (o.Name ?? "").IndexOf("Playback", StringComparison.OrdinalIgnoreCase) >= 0);
-            if (options == null)
+            if (connectError != null)
             {
-                string known = string.Join(" | ", NinjaTrader.Core.Globals.ConnectOptions.Select(o => o.Name));
-                WriteStatus(runId, "failed", "no playback connection configured (known: " + known + ")", null);
-                SafeLog(log, "ConnectPlayback: no matching ConnectOptions. Known: " + known);
+                WriteStatus(runId, "failed", connectError, null);
+                SafeLog(log, "ConnectPlayback: " + connectError);
                 return;
             }
-
-            SafeLog(log, "ConnectPlayback: connecting '" + options.Name + "'...");
-            WriteStatus(runId, "running", null, "connecting:" + options.Name);
-            Connection.Connect(options);
 
             DateTime deadline = DateTime.UtcNow.AddSeconds(timeoutSeconds);
             while (DateTime.UtcNow < deadline)
             {
-                Connection pb = Connection.PlaybackConnection;
-                if (pb != null && pb.Status == ConnectionStatus.Connected)
+                string detail = null;
+                bool connected = false;
+                await onUi(() =>
                 {
-                    SafeLog(log, "ConnectPlayback: connected (" + pb.Options.Name + ").");
-                    WriteStatus(runId, "finished", null, "connected:" + pb.Options.Name);
+                    Connection pb = Connection.PlaybackConnection;
+                    connected = pb != null && pb.Status == ConnectionStatus.Connected;
+                    detail = pb != null ? pb.Status.ToString() : "no_connection";
+                });
+                if (connected)
+                {
+                    SafeLog(log, "ConnectPlayback: connected.");
+                    WriteStatus(runId, "finished", null, "connected");
                     return;
                 }
-                WriteStatus(runId, "running", null, "waiting:" + (pb != null ? pb.Status.ToString() : "no_connection"));
+                WriteStatus(runId, "running", null, "waiting:" + detail);
                 await Task.Delay(1000);
             }
             WriteStatus(runId, "failed", "playback connect timeout after " + timeoutSeconds + "s", null);
@@ -160,24 +192,24 @@ namespace NinjaTraderAddOnProject
             }
             SafeLog(log, "EnableStrategy: resolved " + strategyType.AssemblyQualifiedName);
 
-            Account account = Account.All.FirstOrDefault(a => string.Equals(a.Name, accountName, StringComparison.OrdinalIgnoreCase));
-            if (account == null)
-            {
-                string known = string.Join(" | ", Account.All.Select(a => a.Name));
-                WriteStatus(runId, "failed", "account not found: " + accountName + " (known: " + known + ")", null);
-                return;
-            }
-
             var transitions = new StringBuilder();
             StrategyBase strategy = null;
+            Account account = null;
             Exception walkError = null;
 
-            // Strategy configuration + state walk on the global UI dispatcher (NT's
-            // own Strategies grid drives strategies from its UI thread).
-            await System.Windows.Application.Current.Dispatcher.InvokeAsync(new Action(() =>
+            // ALL NT-object access on the UI dispatcher: Account.All / Connection
+            // calls from a worker thread trip NT's internal Debug.Assert dialogs
+            // (live-observed iteration 2), which block the whole IPC pipeline.
+            Func<Action, Task> onUi = action => System.Windows.Application.Current.Dispatcher.InvokeAsync(action).Task;
+
+            await onUi(() =>
             {
                 try
                 {
+                    account = Account.All.FirstOrDefault(a => string.Equals(a.Name, accountName, StringComparison.OrdinalIgnoreCase));
+                    if (account == null)
+                        return;
+
                     strategy = (StrategyBase)Activator.CreateInstance(strategyType);
                     transitions.Append("created:").Append(strategy.State);
 
@@ -186,6 +218,18 @@ namespace NinjaTraderAddOnProject
 
                     StrategyAnalyzerAutomation.ApplySimpleXmlProperties(strategy, strategyElement);
                     StrategyAnalyzerAutomation.ApplyBarsPeriod(strategy, strategyElement);
+
+                    // Iteration 3: the parity templates are SA fixed-backtest XMLs and
+                    // carry Category=Backtest — but a Backtest-category strategy is
+                    // hosted by RunBacktest(), not the realtime engine, which is the
+                    // prime suspect for SetState(Active) being silently refused in
+                    // iterations 1-2. A live enable is Category.NinjaScript (what the
+                    // Strategies grid runs).
+                    strategy.Category = Category.NinjaScript;
+                    strategy.Workspace = NinjaTrader.Core.Globals.ActiveWorkspace;
+                    strategy.SetUniqueId();
+                    transitions.Append(" -> category:").Append(strategy.Category)
+                               .Append(" ws:").Append(strategy.Workspace ?? "null");
 
                     string instrumentName = strategy.InstrumentOrInstrumentList;
                     if (!string.IsNullOrWhiteSpace(instrumentName))
@@ -200,43 +244,39 @@ namespace NinjaTraderAddOnProject
 
                     strategy.SetState(State.Configure);
                     transitions.Append(" -> configure:").Append(strategy.State);
-
-                    strategy.SetState(State.Active);
-                    transitions.Append(" -> active:").Append(strategy.State);
-
-                    // Iteration 2 (first run stalled at Configure; SetState(Active)
-                    // was silently refused): register with the account's strategy
-                    // collection — the binding NT's own Strategies grid maintains —
-                    // then retry the forward states, escalating one at a time. Every
-                    // attempt is logged; whichever rung moves the state is the answer
-                    // the experiment exists to find.
-                    if (strategy.State == State.Configure)
-                    {
-                        try
-                        {
-                            if (!account.Strategies.Contains(strategy))
-                                account.Strategies.Add(strategy);
-                            transitions.Append(" -> acctAdd:").Append(strategy.State);
-                        }
-                        catch (Exception ex)
-                        {
-                            transitions.Append(" -> acctAdd:EX(").Append(ex.Message).Append(")");
-                        }
-
-                        strategy.SetState(State.Active);
-                        transitions.Append(" -> active2:").Append(strategy.State);
-                    }
-                    if (strategy.State == State.Configure)
-                    {
-                        strategy.SetState(State.DataLoaded);
-                        transitions.Append(" -> dataloaded:").Append(strategy.State);
-                    }
                 }
                 catch (Exception ex)
                 {
                     walkError = ex;
                 }
-            }));
+            });
+
+            if (account == null)
+            {
+                WriteStatus(runId, "failed", "account not found: " + accountName, null);
+                return;
+            }
+
+            // Paced Active attempts in SEPARATE dispatcher frames: SetState ignores
+            // re-entrant/back-to-back calls ("multiple calls ignored" per setstate.md),
+            // so give the engine a frame + a second between attempts.
+            for (int attempt = 1; attempt <= 3 && walkError == null; attempt++)
+            {
+                bool done = false;
+                await onUi(() =>
+                {
+                    try
+                    {
+                        if (strategy.State != State.Configure) { done = true; return; }
+                        strategy.SetState(State.Active);
+                        transitions.Append(" -> active").Append(attempt).Append(":").Append(strategy.State);
+                    }
+                    catch (Exception ex) { walkError = ex; }
+                });
+                if (done)
+                    break;
+                await Task.Delay(1000);
+            }
 
             if (walkError != null)
             {
