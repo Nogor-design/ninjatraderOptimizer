@@ -141,40 +141,160 @@ namespace NinjaTrader.Custom.AddOns.Automation
             return newTab ?? GetSelectedTab(saWindow);
         }
 
-        public static void CloseTab(object saWindow, object tab)
+        // Closes the Strategy Analyzer tab hosting `tab` and returns a
+        // human-readable diagnostic describing what was attempted and whether the
+        // tab count actually dropped.
+        //
+        // The host NinjaTrader.Gui assembly is partially obfuscated — the bodies
+        // of logic methods (e.g. OnCloseTab) are stripped from the shipped DLL, so
+        // they cannot be trusted to do anything when invoked by reflection. We
+        // therefore close a tab by explicitly removing its wrapping TabItem from
+        // whichever backing collection the TabControl uses (ItemsSource when bound,
+        // otherwise Items), and verify by re-counting. OnCloseTab() is kept only as
+        // a last-resort fallback for builds where it is honoured.
+        public static string CloseTab(object saWindow, object tab)
         {
             if (saWindow == null || tab == null || !saType.IsInstanceOfType(saWindow))
-                return;
+                return "CloseTab skipped: null saWindow or tab.";
 
-            InvokeOnAnalyzerDispatcher(saWindow, () =>
+            return InvokeOnAnalyzerDispatcher(saWindow, () =>
             {
-                object viewModel = GetViewModel(saWindow);
-                object currentTab = GetSelectedTab(saWindow);
-                int tabCount = GetTabCountCore(saWindow);
-                if (tabCount <= 1)
-                    return;
-
-                saVmType.GetProperty("SelectedTab", BindingFlags.Public | BindingFlags.Instance)?.SetValue(viewModel, tab);
-
-                TabControl tabControl = saType.GetProperty("MainTabControl", BindingFlags.Public | BindingFlags.Instance)?.GetValue(saWindow) as TabControl
-                    ?? saType.GetField("saTabControl", BindingFlags.NonPublic | BindingFlags.Instance)?.GetValue(saWindow) as TabControl;
-                if (tabControl != null)
-                    tabControl.SelectedItem = tab;
-
-                MethodInfo closeMethod = saType.GetMethod("OnCloseTab", BindingFlags.Public | BindingFlags.Instance);
-                if (closeMethod != null)
-                    closeMethod.Invoke(saWindow, null);
-
-                if (ContainsTab(saWindow, tab) && tabControl != null && tabControl.Items.Contains(tab) && tabControl.Items.Count > 1)
-                    tabControl.Items.Remove(tab);
-
-                if (currentTab != null && !ReferenceEquals(currentTab, tab) && ContainsTab(saWindow, currentTab))
+                System.Text.StringBuilder sb = new System.Text.StringBuilder();
+                try
                 {
-                    saVmType.GetProperty("SelectedTab", BindingFlags.Public | BindingFlags.Instance)?.SetValue(viewModel, currentTab);
+                    object viewModel = GetViewModel(saWindow);
+                    object currentTab = GetSelectedTab(saWindow);
+                    TabControl tabControl = ResolveTabControl(saWindow);
+                    int before = CountTabs(saWindow, tabControl);
+
+                    sb.Append("CloseTab before=").Append(before)
+                      .Append(" page=").Append(tab.GetType().Name)
+                      .Append(" tabControl=").Append(tabControl == null ? "null" : tabControl.GetType().Name);
                     if (tabControl != null)
-                        tabControl.SelectedItem = currentTab;
+                        sb.Append(" itemsSource=").Append(tabControl.ItemsSource == null ? "null" : tabControl.ItemsSource.GetType().Name)
+                          .Append(" items=").Append(tabControl.Items.Count);
+
+                    if (before <= 1)
+                    {
+                        sb.Append(" -> skip (<=1 tab).");
+                        return sb.ToString();
+                    }
+
+                    bool removed = false;
+                    if (tabControl != null)
+                        removed = TryRemoveTab(tabControl, tab, sb);
+
+                    if (!removed)
+                    {
+                        // Fallback: select the tab and ask NT to close it. May be a
+                        // no-op on obfuscated builds; the before/after count tells us.
+                        SelectTab(viewModel, tabControl, tab);
+                        MethodInfo closeMethod = saType.GetMethod("OnCloseTab", BindingFlags.Public | BindingFlags.Instance);
+                        sb.Append(" onCloseTab=").Append(closeMethod == null ? "missing" : "invoked");
+                        if (closeMethod != null)
+                            closeMethod.Invoke(saWindow, null);
+                    }
+
+                    int after = CountTabs(saWindow, tabControl);
+                    sb.Append(" after=").Append(after)
+                      .Append(after < before ? " -> CLOSED." : " -> NO CHANGE (leaked).");
+
+                    // Restore selection to the tab that was active before we started,
+                    // if it survived.
+                    if (currentTab != null && !ReferenceEquals(currentTab, tab))
+                        SelectTab(viewModel, tabControl, currentTab);
+
+                    return sb.ToString();
+                }
+                catch (Exception ex)
+                {
+                    while (ex is TargetInvocationException && ex.InnerException != null)
+                        ex = ex.InnerException;
+                    sb.Append(" -> EXCEPTION ").Append(ex.GetType().Name).Append(": ").Append(ex.Message);
+                    return sb.ToString();
                 }
             });
+        }
+
+        private static TabControl ResolveTabControl(object saWindow)
+        {
+            return saType.GetProperty("MainTabControl", BindingFlags.Public | BindingFlags.Instance)?.GetValue(saWindow) as TabControl
+                ?? saType.GetField("saTabControl", BindingFlags.NonPublic | BindingFlags.Instance)?.GetValue(saWindow) as TabControl;
+        }
+
+        private static int CountTabs(object saWindow, TabControl tabControl)
+        {
+            if (tabControl != null)
+            {
+                if (tabControl.ItemsSource is ICollection src)
+                    return src.Count;
+                return tabControl.Items.Count;
+            }
+            return GetTabCountCore(saWindow);
+        }
+
+        // True when `element` is the page itself, or a TabItem/ContentControl whose
+        // Content is the page, or any element whose DataContext is the page.
+        private static bool MatchesPage(object element, object page)
+        {
+            if (ReferenceEquals(element, page))
+                return true;
+            ContentControl cc = element as ContentControl;
+            if (cc != null && ReferenceEquals(cc.Content, page))
+                return true;
+            FrameworkElement fe = element as FrameworkElement;
+            if (fe != null && ReferenceEquals(fe.DataContext, page))
+                return true;
+            return false;
+        }
+
+        // Removes the entry hosting `page` from whichever backing collection the
+        // TabControl uses. Handles both ItemsSource-bound and direct-Items modes.
+        private static bool TryRemoveTab(TabControl tabControl, object page, System.Text.StringBuilder sb)
+        {
+            IList source = tabControl.ItemsSource as IList;
+            if (source != null)
+            {
+                for (int i = 0; i < source.Count; i++)
+                {
+                    if (MatchesPage(source[i], page))
+                    {
+                        source.RemoveAt(i);
+                        sb.Append(" removed=itemsSource[").Append(i).Append(']');
+                        return true;
+                    }
+                }
+                sb.Append(" itemsSource:no-match");
+                return false;
+            }
+
+            for (int i = 0; i < tabControl.Items.Count; i++)
+            {
+                if (MatchesPage(tabControl.Items[i], page))
+                {
+                    object victim = tabControl.Items[i];
+                    tabControl.Items.Remove(victim);
+                    sb.Append(" removed=items[").Append(i).Append(']');
+                    return true;
+                }
+            }
+            sb.Append(" items:no-match");
+            return false;
+        }
+
+        private static void SelectTab(object viewModel, TabControl tabControl, object page)
+        {
+            if (viewModel != null)
+                saVmType.GetProperty("SelectedTab", BindingFlags.Public | BindingFlags.Instance)?.SetValue(viewModel, page);
+            if (tabControl != null)
+            {
+                object target = page;
+                for (int i = 0; i < tabControl.Items.Count; i++)
+                {
+                    if (MatchesPage(tabControl.Items[i], page)) { target = tabControl.Items[i]; break; }
+                }
+                tabControl.SelectedItem = target;
+            }
         }
 
         private static int GetTabCountCore(object saWindow)
@@ -440,14 +560,19 @@ namespace NinjaTrader.Custom.AddOns.Automation
             if (type != null)
                 return type;
 
+            // Keep the LAST match: NinjaTrader cannot unload custom assemblies, so every
+            // NinjaScript recompile leaves the stale assembly resident and loads the new
+            // one AFTER it. First-match returned the stale type, so strategy properties
+            // added since the last NT restart silently failed to apply (GetProperty null).
+            Type latest = null;
             foreach (Assembly assembly in AppDomain.CurrentDomain.GetAssemblies())
             {
                 type = assembly.GetType(typeName, false);
                 if (type != null)
-                    return type;
+                    latest = type;
             }
 
-            return null;
+            return latest;
         }
 
         private static void ApplySimpleXmlProperties(object target, XElement source)
@@ -874,12 +999,12 @@ namespace NinjaTrader.Custom.AddOns.Automation
             method?.Invoke(grid, new object[] { fileName });
         }
 
-        public static void Run(object saWindow)
+        public static bool Run(object saWindow)
         {
-            if (saWindow == null || !saType.IsInstanceOfType(saWindow)) return;
+            if (saWindow == null || !saType.IsInstanceOfType(saWindow)) return false;
 
             var viewModel = GetViewModel(saWindow);
-            if (viewModel == null) return;
+            if (viewModel == null) return false;
 
             // Use the RunCommand field which is the ICommand for starting backtests
             var runCommandField = saVmType.GetField("RunCommand", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.Static);
@@ -887,16 +1012,21 @@ namespace NinjaTrader.Custom.AddOns.Automation
 
             if (runCommand != null)
             {
-                InvokeOnAnalyzerDispatcher(saWindow, () => {
-                    if (runCommand.CanExecute(null))
-                        runCommand.Execute(null);
+                return InvokeOnAnalyzerDispatcher(saWindow, () => {
+                    if (!runCommand.CanExecute(null))
+                        return false;
+                    runCommand.Execute(null);
+                    return true;
                 });
             }
             else
             {
                 // Fallback to OnRun handler if command field not found
-                saVmType.GetMethod("OnRun", BindingFlags.NonPublic | BindingFlags.Instance)
-                        ?.Invoke(viewModel, new object[] { null, null });
+                MethodInfo onRun = saVmType.GetMethod("OnRun", BindingFlags.NonPublic | BindingFlags.Instance);
+                if (onRun == null)
+                    return false;
+                onRun.Invoke(viewModel, new object[] { null, null });
+                return true;
             }
         }
     }
