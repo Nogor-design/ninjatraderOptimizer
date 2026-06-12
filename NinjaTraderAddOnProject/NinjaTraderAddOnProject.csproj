@@ -77,7 +77,9 @@
       <DependentUpon>AddOnPage.xaml</DependentUpon>
     </Compile>
     <Compile Include="BatchControl.cs" />
+    <Compile Include="CompileObserverService.cs" />
     <Compile Include="StrategyAnalyzerAutomation.cs" />
+    <Compile Include="StrategyLifecycleService.cs" />
     <Compile Include="Properties\AssemblyInfo.cs">
       <SubType>Code</SubType>
     </Compile>

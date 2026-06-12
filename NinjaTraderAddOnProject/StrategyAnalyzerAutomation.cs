@@ -547,7 +547,7 @@ namespace NinjaTrader.Custom.AddOns.Automation
             });
         }
 
-        private static Type ResolveType(string typeName)
+        internal static Type ResolveType(string typeName)
         {
             if (string.IsNullOrWhiteSpace(typeName))
                 return null;
@@ -575,7 +575,7 @@ namespace NinjaTrader.Custom.AddOns.Automation
             return latest;
         }
 
-        private static void ApplySimpleXmlProperties(object target, XElement source)
+        internal static void ApplySimpleXmlProperties(object target, XElement source)
         {
             if (target == null || source == null)
                 return;
@@ -602,7 +602,7 @@ namespace NinjaTrader.Custom.AddOns.Automation
             }
         }
 
-        private static void ApplyBarsPeriod(object strategyTemplate, XElement strategyElement)
+        internal static void ApplyBarsPeriod(object strategyTemplate, XElement strategyElement)
         {
             XElement barsElement = strategyElement?.Element("BarsPeriodSerializable");
             object barsPeriod = CreateBarsPeriod(barsElement);
