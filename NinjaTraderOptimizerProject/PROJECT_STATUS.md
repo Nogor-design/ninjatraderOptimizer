@@ -2,6 +2,12 @@
 
 ## Current Status
 
+Phase 0 baseline update (2026-09-01): the source rebuilds against the
+installed NinjaTrader 8.1.8.1 assemblies, but the installed optimizer DLL still
+references NinjaTrader Core 8.1.6.3. Automatic post-build deployment has been
+removed. Current-version selector/runtime behavior remains behind
+`..\docs\NT_8_1_8_1_REGRESSION_PLAN.md`.
+
 The optimizer and optimization fitness components have been split into a standalone project:
 
 ```text
@@ -15,7 +21,7 @@ The project is set up to build the same way as the main AddOn project:
 - x64 target
 - NinjaTrader DLL references
 - MSBuild-compatible project file
-- post-build copy to NinjaTrader's `bin\Custom` folder
+- explicit, owner-gated deployment separate from the build
 
 Build verification:
 
@@ -66,13 +72,16 @@ Preferred learning-loop build command:
 
 This writes MSBuild output to `rag\build_logs\` so compile failures can be fed back into the RAG repair workflow.
 
-Preferred deploy command after a successful build:
+Deploy only after the safe-shutdown checks and explicit owner authorization:
 
 ```powershell
-.\tools\Deploy-Optimizer.ps1
+.\tools\Deploy-Optimizer.ps1 -OwnerAuthorizedRestart
 ```
 
-This stops NinjaTrader, copies the optimizer DLL/PDB to NinjaTrader's custom bin folder, and restarts NinjaTrader.
+The script refuses to deploy while NinjaTrader is running unless the explicit
+authorization switch is supplied. It requests a graceful shutdown and refuses
+to copy if NinjaTrader does not close within 30 seconds; it never force-stops
+the process.
 
 ## RAG Workflow
 
@@ -96,7 +105,8 @@ Ask the docs RAG for optimizer-specific help with:
 
 ## Deployment Behavior
 
-On successful build, the project post-build event copies:
+A successful build writes only to the project output folder. Deployment is a
+separate step that copies:
 
 - `NinjaTraderOptimizerProject.dll`
 - `NinjaTraderOptimizerProject.pdb`
@@ -107,15 +117,18 @@ to:
 C:\Users\Owner\Documents\NinjaTrader 8\bin\Custom
 ```
 
-For runtime testing, stop NinjaTrader before building/deploying, then restart NinjaTrader after the DLL/PDB have copied.
+Before runtime deployment, prove that Orders and Positions are empty, all
+strategies are disabled, and no order-capable automation is active. Obtain
+owner authorization, then use the guarded deployment script.
 
 ## Known Limitations
 
 - The optimizer implementation is coverage-oriented sampling, not a complete genetic or Pareto optimizer.
 - The fitness implementation calculates net profit and profit factor diagnostics, but NinjaTrader's ranking value is currently only profit factor.
 - Runtime selector behavior still needs to be verified inside Strategy Analyzer after deployment.
-- The main AddOn still contains the original optimizer source files on disk, but they are no longer compiled by that project.
+- The 8.1.8.1 selector and runtime regression package is not yet complete.
 
 ## Next Step
 
-Verify inside Strategy Analyzer that the custom optimizer and custom fitness appear without duplicate type or load errors, then run a small custom optimizer template and confirm Output tab messages show `Starting coverage-search run`.
+Execute the custom optimizer and fitness cases in
+`..\docs\NT_8_1_8_1_REGRESSION_PLAN.md` after the owner-gated deployment.

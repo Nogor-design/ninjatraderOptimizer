@@ -64,19 +64,23 @@ NinjaTrader loads compiled custom DLLs from:
 C:\Users\Owner\Documents\NinjaTrader 8\bin\Custom
 ```
 
-The project has a post-build event that copies:
+Build and deployment are intentionally separate. A successful build produces:
 
 - `NinjaTraderOptimizerProject.dll`
 - `NinjaTraderOptimizerProject.pdb`
 
-to the NinjaTrader custom bin folder.
+in the project output folder. It does not copy into NinjaTrader automatically.
 
 For a clean deploy:
 
 ```powershell
 .\tools\Build-WithLearningLog.ps1
-.\tools\Deploy-Optimizer.ps1
+.\tools\Deploy-Optimizer.ps1 -OwnerAuthorizedRestart
 ```
+
+Before deployment, establish that Orders and Positions are empty, all
+strategies are disabled, and no order-capable automation is active. The deploy
+script requests a graceful shutdown and refuses to force-stop NinjaTrader.
 
 ## Relationship To The Batch AddOn
 
@@ -139,7 +143,7 @@ The RAG system should be used before changing unfamiliar NinjaTrader optimizer A
 ## Testing Plan
 
 1. Build with MSBuild.
-2. Stop NinjaTrader, deploy DLL/PDB, restart NinjaTrader.
+2. After the explicit safety and owner gate, deploy DLL/PDB and restart NinjaTrader.
 3. Open Strategy Analyzer.
 4. Start a small optimization using a known built-in strategy and instrument.
 5. Select `CustomMultiObjectiveOptimizer`.

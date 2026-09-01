@@ -16,7 +16,7 @@ $logPath = Join-Path $logRoot "msbuild_$timestamp.txt"
 Write-Host "Building $SolutionPath"
 Write-Host "Log: $logPath"
 
-& $MSBuildPath $SolutionPath /p:Configuration=$Configuration /t:Rebuild /nologo 2>&1 |
+& $MSBuildPath $SolutionPath /p:Configuration=$Configuration /p:PostBuildEvent= /t:Rebuild /nologo 2>&1 |
     Tee-Object -FilePath $logPath
 
 $exitCode = $LASTEXITCODE

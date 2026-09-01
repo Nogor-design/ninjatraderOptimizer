@@ -151,8 +151,7 @@ namespace NinjaTrader.NinjaScript.AddOns
 						return;
 					string json = File.ReadAllText(path);
 					bool isCompile = NinjaTraderAddOnProject.CompileObserverService.IsObserveCompileCommand(json);
-					bool isLifecycle = NinjaTraderAddOnProject.StrategyLifecycleService.IsLifecycleCommand(json);
-					if (!isCompile && !isLifecycle)
+					if (!isCompile)
 						return;
 					lock (compileCommandSync)
 					{
@@ -161,14 +160,9 @@ namespace NinjaTrader.NinjaScript.AddOns
 						compileCommandProcessing = true;
 						compileCommandLastJson = json;
 					}
-					if (isCompile)
-						await NinjaTraderAddOnProject.CompileObserverService.ObserveCompile(
-							json,
-							message => NinjaTrader.Code.Output.Process("BatchStrategyOptimizer: " + message, PrintTo.OutputTab1));
-					else
-						await NinjaTraderAddOnProject.StrategyLifecycleService.Handle(
-							json,
-							message => NinjaTrader.Code.Output.Process("BatchStrategyOptimizer: " + message, PrintTo.OutputTab1));
+					await NinjaTraderAddOnProject.CompileObserverService.ObserveCompile(
+						json,
+						message => NinjaTrader.Code.Output.Process("BatchStrategyOptimizer: " + message, PrintTo.OutputTab1));
 				}
 				catch (Exception ex)
 				{

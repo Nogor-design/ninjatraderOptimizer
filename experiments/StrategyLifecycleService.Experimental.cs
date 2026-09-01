@@ -1,3 +1,8 @@
+// EXPERIMENTAL, NOT COMPILED INTO NinjaTraderAddOnProject.dll.
+// ConnectPlayback worked in the June 2026 spike, but external strategy enable
+// stalled at Configure on NinjaTrader 8.1.7.1. Preserve this source as research
+// evidence only; production IPC accepts ObserveCompile and RunBatch commands.
+
 using System;
 using System.Collections.Generic;
 using System.Globalization;

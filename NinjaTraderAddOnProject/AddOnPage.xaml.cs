@@ -19,7 +19,9 @@ namespace NinjaTraderAddOnProject
         public AddOnPage()
         {
             InitializeComponent();
-            SetupIPC();
+            // RunBatch IPC is owned by the injected BatchControl. Keeping a
+            // second watcher here caused the same command file to launch two
+            // Strategy Analyzer jobs when this legacy tab was open.
         }
 
         private void btnBrowseSource_Click(object sender, RoutedEventArgs e)

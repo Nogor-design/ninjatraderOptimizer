@@ -3,7 +3,12 @@
 
 NinjaTraderAddOnProject/bin/
 NinjaTraderAddOnProject/obj/
+NinjaTraderOptimizerProject/NinjaTraderOptimizerProject/bin/
+NinjaTraderOptimizerProject/NinjaTraderOptimizerProject/obj/
+NinjaTraderOptimizerProject/rag/build_logs/
+NinjaTraderOptimizerProject/rag/outputs/
 *.user
+*.tmp.*
 
 *.suo
 *.cache

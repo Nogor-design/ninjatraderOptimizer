@@ -38,6 +38,9 @@ namespace NinjaTraderAddOnProject
         private StackPanel batchPanel;
         private Expander expander;
         private FileSystemWatcher commandWatcher;
+        private static readonly object IpcCommandSync = new object();
+        private static string acceptedRunBatchId;
+        private static string acceptedRunBatchPayload;
         private bool cancelRequested;
         private object currentBatchTab;
 
@@ -51,6 +54,7 @@ namespace NinjaTraderAddOnProject
         private int currentTotalCount;
         private string lastErrorMessage;
         private string requestedInstrument;
+        private int requestedTimeoutSeconds = 600;
 
         private class BatchRunRecord
         {
@@ -75,7 +79,6 @@ namespace NinjaTraderAddOnProject
             saWindow = sa;
             InitializeUI();
             SubscribeToStrategyChanges();
-            SetupIPC();
         }
 
         private void InitializeUI()
@@ -239,7 +242,12 @@ namespace NinjaTraderAddOnProject
             expander.Content = main;
             Content = expander;
 
-            Loaded += (s, e) => RefreshForAnalyzerSelection();
+            Loaded += (s, e) =>
+            {
+                RefreshForAnalyzerSelection();
+                SetupIPC();
+            };
+            Unloaded += (s, e) => DisposeIPC();
         }
 
         private Grid CreateFolderRow(out TextBox textBox, out Button browseButton)
@@ -399,7 +407,7 @@ namespace NinjaTraderAddOnProject
             try
             {
                 if (currentBatchTab != null)
-                    StrategyAnalyzerAutomation.CloseTab(saWindow, currentBatchTab);
+                    Log(StrategyAnalyzerAutomation.CloseTab(saWindow, currentBatchTab));
             }
             catch (Exception ex)
             {
@@ -411,21 +419,46 @@ namespace NinjaTraderAddOnProject
         {
             try
             {
+                if (commandWatcher != null)
+                    return;
+
                 string tempDir = @"C:\temp";
                 if (!Directory.Exists(tempDir))
                     Directory.CreateDirectory(tempDir);
 
                 commandWatcher = new FileSystemWatcher(tempDir, "nt8_command.json");
-                commandWatcher.NotifyFilter = NotifyFilters.LastWrite | NotifyFilters.CreationTime | NotifyFilters.Size;
+                commandWatcher.NotifyFilter = NotifyFilters.LastWrite | NotifyFilters.CreationTime | NotifyFilters.Size | NotifyFilters.FileName;
                 commandWatcher.Changed += OnCommandFileChanged;
                 commandWatcher.Created += OnCommandFileChanged;
                 commandWatcher.Renamed += OnCommandFileChanged;
+                commandWatcher.Deleted += OnCommandFileDeleted;
                 commandWatcher.EnableRaisingEvents = true;
-                Log("IPC watcher ready at C:\\temp\\nt8_command.json.");
+                Log("IPC watcher ready at C:\\temp\\nt8_command.json (cancel-on-delete enabled).");
             }
             catch (Exception ex)
             {
                 Log("IPC setup error: " + ex.Message);
+            }
+        }
+
+        private void DisposeIPC()
+        {
+            FileSystemWatcher watcher = commandWatcher;
+            commandWatcher = null;
+            if (watcher == null)
+                return;
+            try
+            {
+                watcher.EnableRaisingEvents = false;
+                watcher.Changed -= OnCommandFileChanged;
+                watcher.Created -= OnCommandFileChanged;
+                watcher.Renamed -= OnCommandFileChanged;
+                watcher.Deleted -= OnCommandFileDeleted;
+                watcher.Dispose();
+            }
+            catch (Exception ex)
+            {
+                Log("IPC watcher disposal error: " + ex.Message);
             }
         }
 
@@ -437,6 +470,26 @@ namespace NinjaTraderAddOnProject
                 try
                 {
                     string json = File.ReadAllText(e.FullPath);
+                    string action = ExtractJsonString(json, "action");
+
+                    if (action != null && action.Equals("ObserveCompile", StringComparison.OrdinalIgnoreCase))
+                    {
+                        // ObserveCompile is handled by the global AddOn watcher
+                        // so it works even before Strategy Analyzer is opened.
+                        return;
+                    }
+
+                    // Explicit cancel payload from the web UI (the python
+                    // side may write {"action":"Cancel",...} instead of
+                    // deleting the file). Cancel only makes sense when a
+                    // batch is in flight; otherwise treat as no-op.
+                    if (action != null && action.Equals("Cancel", StringComparison.OrdinalIgnoreCase))
+                    {
+                        if (isRunning && !cancelRequested)
+                            RequestCancelFromIpc("explicit Cancel action from IPC payload");
+                        return;
+                    }
+
                     if (json.IndexOf("RunBatch", StringComparison.OrdinalIgnoreCase) < 0)
                         return;
 
@@ -444,10 +497,25 @@ namespace NinjaTraderAddOnProject
                     string destFolder = ExtractJsonString(json, "destFolder");
                     string runId = ExtractJsonString(json, "runId");
                     string instrument = ExtractJsonString(json, "instrument");
+                    int timeoutSeconds = Math.Max(5, ExtractJsonInt(json, "timeoutSeconds", 600));
+                    // Honor the IPC payload's request to close per-template tabs
+                    // after each run. The Python web side always sets this to
+                    // true so accumulated Strategy Analyzer tabs don't blow up
+                    // NinjaTrader's memory across a multi-stage recipe. Manual
+                    // GUI runs keep using the checkbox state unchanged.
+                    bool? requestedCloseTempTabs = ExtractJsonBool(json, "closeTempTabs");
+
+                    if (!TryAcceptRunBatch(runId, json))
+                    {
+                        Log("Ignored duplicate RunBatch IPC command"
+                            + (string.IsNullOrWhiteSpace(runId) ? "." : " for " + runId + "."));
+                        return;
+                    }
 
                     if (!string.IsNullOrWhiteSpace(runId))
                         currentRunId = runId;
                     requestedInstrument = string.IsNullOrWhiteSpace(instrument) ? null : instrument;
+                    requestedTimeoutSeconds = timeoutSeconds;
 
                     _ = Dispatcher.BeginInvoke(new Action(() =>
                     {
@@ -455,6 +523,9 @@ namespace NinjaTraderAddOnProject
                             txtSourceFolder.Text = sourceFolder;
                         if (!string.IsNullOrWhiteSpace(destFolder))
                             txtDestFolder.Text = destFolder;
+
+                        if (requestedCloseTempTabs.HasValue && chkCloseTempTabs != null)
+                            chkCloseTempTabs.IsChecked = requestedCloseTempTabs.Value;
 
                         chkBatchMode.IsChecked = true;
                         btnStart_Click(null, null);
@@ -467,10 +538,91 @@ namespace NinjaTraderAddOnProject
             });
         }
 
+        private bool TryAcceptRunBatch(string runId, string json)
+        {
+            lock (IpcCommandSync)
+            {
+                if (!string.IsNullOrWhiteSpace(runId))
+                {
+                    if (string.Equals(acceptedRunBatchId, runId, StringComparison.Ordinal))
+                        return false;
+                    acceptedRunBatchId = runId;
+                    acceptedRunBatchPayload = json;
+                    return true;
+                }
+
+                if (string.Equals(acceptedRunBatchPayload, json, StringComparison.Ordinal))
+                    return false;
+                acceptedRunBatchPayload = json;
+                acceptedRunBatchId = null;
+                return true;
+            }
+        }
+
+        private void OnCommandFileDeleted(object sender, FileSystemEventArgs e)
+        {
+            // The web UI's cancel path unlinks C:\temp\nt8_command.json.
+            // Treat the deletion as a cancel signal *only* if a batch is in
+            // flight — a delete during idle is fine (e.g. operator cleanup
+            // between sessions).
+            _ = Task.Run(async () =>
+            {
+                // Tiny debounce: some editors atomically save by
+                // delete+rename, which would otherwise fire a spurious
+                // cancel between a Run dispatch and the next Created event.
+                await Task.Delay(150);
+                if (File.Exists(e.FullPath))
+                    return;
+                if (isRunning && !cancelRequested)
+                    RequestCancelFromIpc("nt8_command.json deleted while batch running");
+            });
+        }
+
+        private void RequestCancelFromIpc(string reason)
+        {
+            try
+            {
+                _ = Dispatcher.BeginInvoke(new Action(() =>
+                {
+                    cancelRequested = true;
+                    if (btnCancel != null)
+                        btnCancel.IsEnabled = false;
+                    Log("Cancel requested via IPC: " + reason +
+                        ". Stopping after the current template; the in-flight optimization will finish in NT.");
+                }));
+            }
+            catch (Exception ex)
+            {
+                Log("RequestCancelFromIpc error: " + Unwrap(ex));
+            }
+        }
+
         private string ExtractJsonString(string json, string propertyName)
         {
             Match match = Regex.Match(json, "\"" + Regex.Escape(propertyName) + "\"\\s*:\\s*\"(?<value>(?:\\\\.|[^\"])*)\"", RegexOptions.IgnoreCase);
             return match.Success ? match.Groups["value"].Value.Replace("\\\\", "\\").Replace("\\\"", "\"") : null;
+        }
+
+        private int ExtractJsonInt(string json, string propertyName, int defaultValue)
+        {
+            Match match = Regex.Match(json, "\"" + Regex.Escape(propertyName) + "\"\\s*:\\s*(?<value>-?\\d+)", RegexOptions.IgnoreCase);
+            if (!match.Success)
+                return defaultValue;
+            int value;
+            return int.TryParse(match.Groups["value"].Value, NumberStyles.Integer, CultureInfo.InvariantCulture, out value)
+                ? value
+                : defaultValue;
+        }
+
+        // Parse a JSON boolean field (true/false). Returns null when the field
+        // is absent or unparseable, so callers can distinguish "not specified"
+        // from "explicitly false".
+        private bool? ExtractJsonBool(string json, string propertyName)
+        {
+            Match match = Regex.Match(json, "\"" + Regex.Escape(propertyName) + "\"\\s*:\\s*(?<value>true|false)", RegexOptions.IgnoreCase);
+            if (!match.Success)
+                return null;
+            return match.Groups["value"].Value.Equals("true", StringComparison.OrdinalIgnoreCase);
         }
 
         // ------------------------------------------------------------------
@@ -488,6 +640,7 @@ namespace NinjaTraderAddOnProject
                 sb.Append("\"completed\":").Append(currentCompletedCount.ToString(CultureInfo.InvariantCulture)).Append(",");
                 sb.Append("\"total\":").Append(currentTotalCount.ToString(CultureInfo.InvariantCulture)).Append(",");
                 sb.Append("\"lastError\":").Append(EncodeJsonString(lastErrorMessage)).Append(",");
+                sb.Append("\"timeoutSeconds\":").Append(requestedTimeoutSeconds.ToString(CultureInfo.InvariantCulture)).Append(",");
                 sb.Append("\"heartbeatUtc\":").Append(EncodeJsonString(DateTime.UtcNow.ToString("o", CultureInfo.InvariantCulture))).Append(",");
                 sb.Append("\"outputRoot\":").Append(EncodeJsonString(currentDestFolder));
                 sb.Append("}");
@@ -518,6 +671,361 @@ namespace NinjaTraderAddOnProject
                 // Status writing is best-effort; never break the batch over it.
                 try { Log("WriteStatus error: " + ex.Message); } catch { }
             }
+        }
+
+        // ------------------------------------------------------------------
+        // Compile observer: NinjaTrader auto-compiles strategies after Python
+        // installs them into bin\Custom\Strategies. ObserveCompile does not
+        // force compilation; it waits for the auto-compile to settle, checks
+        // whether the strategy type is visible, and exports matching compiler
+        // errors from recent NinjaTrader log/trace files when available.
+        // ------------------------------------------------------------------
+        private class CompileErrorRecord
+        {
+            public string File { get; set; }
+            public int? Line { get; set; }
+            public int? Column { get; set; }
+            public string Code { get; set; }
+            public string Message { get; set; }
+            public string Raw { get; set; }
+            public string Source { get; set; }
+        }
+
+        private async Task ObserveCompile(string json)
+        {
+            string runId = ExtractJsonString(json, "runId");
+            string sourceFile = ExtractJsonString(json, "sourceFile");
+            string strategyName = ExtractJsonString(json, "strategyName");
+            string outputDir = ExtractJsonString(json, "outputDir");
+            int timeoutSeconds = Math.Max(5, ExtractJsonInt(json, "timeoutSeconds", 120));
+            int quietSeconds = Math.Max(1, ExtractJsonInt(json, "waitForQuietSeconds", 3));
+
+            if (string.IsNullOrWhiteSpace(runId))
+                runId = "compile_" + DateTime.UtcNow.ToString("yyyyMMdd_HHmmss", CultureInfo.InvariantCulture);
+            if (string.IsNullOrWhiteSpace(strategyName) && !string.IsNullOrWhiteSpace(sourceFile))
+                strategyName = Path.GetFileNameWithoutExtension(sourceFile);
+            if (string.IsNullOrWhiteSpace(outputDir))
+                outputDir = @"C:\ta_foundation\nt_compile_loop\compiler_errors";
+
+            Directory.CreateDirectory(outputDir);
+            Log("ObserveCompile started for " + (strategyName ?? sourceFile ?? "(unknown strategy)") + ".");
+            WriteCompileStatus(runId, "starting", strategyName, sourceFile, outputDir, false, 0, null, null, null);
+
+            DateTime sourceWriteTime = File.Exists(sourceFile)
+                ? File.GetLastWriteTime(sourceFile)
+                : DateTime.Now;
+            DateTime observeFrom = sourceWriteTime.AddMinutes(-2);
+            DateTime deadline = DateTime.Now.AddSeconds(timeoutSeconds);
+            DateTime lastSourceWrite = sourceWriteTime;
+            List<CompileErrorRecord> errors = new List<CompileErrorRecord>();
+
+            while (DateTime.Now < deadline)
+            {
+                WriteCompileStatus(runId, "waiting_for_auto_compile", strategyName, sourceFile, outputDir, false, 0, null, null, null);
+
+                if (File.Exists(sourceFile))
+                {
+                    DateTime currentWrite = File.GetLastWriteTime(sourceFile);
+                    if (currentWrite > lastSourceWrite)
+                        lastSourceWrite = currentWrite;
+                }
+
+                await Task.Delay(TimeSpan.FromSeconds(quietSeconds));
+                WriteCompileStatus(runId, "observing", strategyName, sourceFile, outputDir, false, 0, null, null, null);
+                errors = FindRecentCompileErrors(strategyName, sourceFile, observeFrom);
+                if (errors.Count > 0)
+                {
+                    string csvPath = Path.Combine(outputDir, runId + "_errors.csv");
+                    string textPath = Path.Combine(outputDir, runId + "_errors.txt");
+                    string resultPath = Path.Combine(outputDir, runId + "_compile_result.json");
+                    WriteCompileErrorsCsv(csvPath, errors);
+                    WriteCompileErrorsText(textPath, errors);
+                    WriteCompileResultJson(resultPath, runId, "failed", strategyName, sourceFile, outputDir, errors, csvPath, textPath, "Compiler errors observed.");
+                    WriteCompileStatus(runId, "failed", strategyName, sourceFile, outputDir, false, errors.Count, csvPath, textPath, errors[0].Message);
+                    Log("ObserveCompile failed for " + strategyName + " with " + errors.Count.ToString(CultureInfo.InvariantCulture) + " observed compiler errors.");
+                    return;
+                }
+
+                if (IsStrategyTypeVisible(strategyName))
+                {
+                    string csvPath = Path.Combine(outputDir, runId + "_errors.csv");
+                    string textPath = Path.Combine(outputDir, runId + "_errors.txt");
+                    string resultPath = Path.Combine(outputDir, runId + "_compile_result.json");
+                    WriteCompileErrorsCsv(csvPath, errors);
+                    WriteCompileErrorsText(textPath, errors);
+                    WriteCompileResultJson(resultPath, runId, "succeeded", strategyName, sourceFile, outputDir, errors, csvPath, textPath, null);
+                    WriteCompileStatus(runId, "succeeded", strategyName, sourceFile, outputDir, true, 0, csvPath, textPath, null);
+                    Log("ObserveCompile succeeded for " + strategyName + ".");
+                    return;
+                }
+
+                await Task.Delay(1000);
+            }
+
+            string timeoutCsv = Path.Combine(outputDir, runId + "_errors.csv");
+            string timeoutText = Path.Combine(outputDir, runId + "_errors.txt");
+            string timeoutResult = Path.Combine(outputDir, runId + "_compile_result.json");
+            string message = "No matching compiler errors were observed, but the strategy type is not visible in loaded NinjaTrader assemblies.";
+            WriteCompileErrorsCsv(timeoutCsv, errors);
+            WriteCompileErrorsText(timeoutText, errors);
+            WriteCompileResultJson(timeoutResult, runId, "timed_out", strategyName, sourceFile, outputDir, errors, timeoutCsv, timeoutText, message);
+            WriteCompileStatus(runId, "timed_out", strategyName, sourceFile, outputDir, false, errors.Count, timeoutCsv, timeoutText, message);
+            Log("ObserveCompile timed out for " + strategyName + ": " + message);
+        }
+
+        private void WriteCompileStatus(
+            string runId,
+            string state,
+            string strategyName,
+            string sourceFile,
+            string outputDir,
+            bool compiled,
+            int errorCount,
+            string errorsCsv,
+            string errorsText,
+            string lastError)
+        {
+            try
+            {
+                StringBuilder sb = new StringBuilder();
+                sb.Append("{");
+                sb.Append("\"runId\":").Append(EncodeJsonString(runId)).Append(",");
+                sb.Append("\"workerKind\":\"compile_observer\",");
+                sb.Append("\"state\":").Append(EncodeJsonString(state)).Append(",");
+                sb.Append("\"strategyName\":").Append(EncodeJsonString(strategyName)).Append(",");
+                sb.Append("\"sourceFile\":").Append(EncodeJsonString(sourceFile)).Append(",");
+                sb.Append("\"compiled\":").Append(compiled ? "true" : "false").Append(",");
+                sb.Append("\"errorCount\":").Append(errorCount.ToString(CultureInfo.InvariantCulture)).Append(",");
+                sb.Append("\"errorsCsv\":").Append(EncodeJsonString(errorsCsv)).Append(",");
+                sb.Append("\"errorsText\":").Append(EncodeJsonString(errorsText)).Append(",");
+                sb.Append("\"lastError\":").Append(EncodeJsonString(lastError)).Append(",");
+                sb.Append("\"heartbeatUtc\":").Append(EncodeJsonString(DateTime.UtcNow.ToString("o", CultureInfo.InvariantCulture))).Append(",");
+                sb.Append("\"outputRoot\":").Append(EncodeJsonString(outputDir));
+                sb.Append("}");
+                AtomicWriteText(StatusFilePath, sb.ToString());
+            }
+            catch (Exception ex)
+            {
+                try { Log("WriteCompileStatus error: " + ex.Message); } catch { }
+            }
+        }
+
+        private void AtomicWriteText(string path, string text)
+        {
+            string dir = Path.GetDirectoryName(path);
+            if (!string.IsNullOrWhiteSpace(dir) && !Directory.Exists(dir))
+                Directory.CreateDirectory(dir);
+            string tmpPath = path + ".tmp";
+            File.WriteAllText(tmpPath, text, new UTF8Encoding(false));
+            try
+            {
+                if (File.Exists(path))
+                    File.Replace(tmpPath, path, null);
+                else
+                    File.Move(tmpPath, path);
+            }
+            catch (IOException)
+            {
+                File.Copy(tmpPath, path, true);
+                try { File.Delete(tmpPath); } catch { }
+            }
+        }
+
+        private bool IsStrategyTypeVisible(string strategyName)
+        {
+            if (string.IsNullOrWhiteSpace(strategyName))
+                return false;
+            string fullName = "NinjaTrader.NinjaScript.Strategies." + strategyName.Trim();
+            foreach (Assembly assembly in AppDomain.CurrentDomain.GetAssemblies())
+            {
+                try
+                {
+                    if (assembly.GetType(fullName, false, true) != null)
+                        return true;
+                }
+                catch { }
+            }
+            return false;
+        }
+
+        private List<CompileErrorRecord> FindRecentCompileErrors(string strategyName, string sourceFile, DateTime observeFrom)
+        {
+            List<CompileErrorRecord> records = new List<CompileErrorRecord>();
+            string documents = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments), "NinjaTrader 8");
+            foreach (string folder in new[] { Path.Combine(documents, "log"), Path.Combine(documents, "trace") })
+            {
+                if (!Directory.Exists(folder))
+                    continue;
+                foreach (string path in Directory.GetFiles(folder, "*.txt").OrderByDescending(p => File.GetLastWriteTime(p)).Take(8))
+                {
+                    try
+                    {
+                        if (File.GetLastWriteTime(path) < observeFrom)
+                            continue;
+                        records.AddRange(ParseCompileErrorsFromText(path, ReadTail(path, 512 * 1024), strategyName, sourceFile));
+                    }
+                    catch { }
+                }
+            }
+
+            return records
+                .GroupBy(r => (r.File ?? "") + "|" + (r.Line.HasValue ? r.Line.Value.ToString(CultureInfo.InvariantCulture) : "") + "|" + (r.Column.HasValue ? r.Column.Value.ToString(CultureInfo.InvariantCulture) : "") + "|" + (r.Code ?? "") + "|" + (r.Message ?? ""))
+                .Select(g => g.First())
+                .ToList();
+        }
+
+        private string ReadTail(string path, int maxBytes)
+        {
+            FileInfo info = new FileInfo(path);
+            using (FileStream stream = File.Open(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+            {
+                long start = Math.Max(0, info.Length - maxBytes);
+                stream.Seek(start, SeekOrigin.Begin);
+                using (StreamReader reader = new StreamReader(stream, Encoding.UTF8, true))
+                {
+                    return reader.ReadToEnd();
+                }
+            }
+        }
+
+        private List<CompileErrorRecord> ParseCompileErrorsFromText(string sourcePath, string text, string strategyName, string sourceFile)
+        {
+            List<CompileErrorRecord> records = new List<CompileErrorRecord>();
+            string fileName = string.IsNullOrWhiteSpace(sourceFile) ? "" : Path.GetFileName(sourceFile);
+            string strategy = strategyName ?? "";
+            Regex csRegex = new Regex(@"(?<file>[A-Za-z]:\\[^:\r\n]+?\.cs|[\w\-. ]+\.cs)?(?:\((?<line>\d+)\s*,\s*(?<column>\d+)\))?.*?(?<code>CS\d{4})\s*:\s*(?<message>.+)", RegexOptions.IgnoreCase);
+
+            foreach (string rawLine in text.Split(new[] { "\r\n", "\n" }, StringSplitOptions.None))
+            {
+                string line = rawLine.Trim();
+                if (string.IsNullOrWhiteSpace(line))
+                    continue;
+                bool mentionsStrategy = (!string.IsNullOrWhiteSpace(strategy) && line.IndexOf(strategy, StringComparison.OrdinalIgnoreCase) >= 0)
+                    || (!string.IsNullOrWhiteSpace(fileName) && line.IndexOf(fileName, StringComparison.OrdinalIgnoreCase) >= 0);
+                bool looksLikeCompileError = Regex.IsMatch(line, @"CS\d{4}", RegexOptions.IgnoreCase)
+                    || (mentionsStrategy && line.IndexOf("compile", StringComparison.OrdinalIgnoreCase) >= 0 && line.IndexOf("error", StringComparison.OrdinalIgnoreCase) >= 0);
+                if (!looksLikeCompileError)
+                    continue;
+
+                Match match = csRegex.Match(line);
+                if (match.Success)
+                {
+                    records.Add(new CompileErrorRecord
+                    {
+                        File = string.IsNullOrWhiteSpace(match.Groups["file"].Value) ? fileName : Path.GetFileName(match.Groups["file"].Value.Trim()),
+                        Line = NullableInt(match.Groups["line"].Value),
+                        Column = NullableInt(match.Groups["column"].Value),
+                        Code = match.Groups["code"].Value.Trim(),
+                        Message = match.Groups["message"].Value.Trim(),
+                        Raw = line,
+                        Source = sourcePath
+                    });
+                }
+                else
+                {
+                    records.Add(new CompileErrorRecord
+                    {
+                        File = fileName,
+                        Line = null,
+                        Column = null,
+                        Code = "",
+                        Message = line,
+                        Raw = line,
+                        Source = sourcePath
+                    });
+                }
+            }
+            return records;
+        }
+
+        private int? NullableInt(string value)
+        {
+            int parsed;
+            if (int.TryParse(value, NumberStyles.Integer, CultureInfo.InvariantCulture, out parsed))
+                return parsed;
+            return null;
+        }
+
+        private void WriteCompileErrorsCsv(string path, List<CompileErrorRecord> errors)
+        {
+            StringBuilder sb = new StringBuilder();
+            sb.AppendLine("NinjaScript File,Error,Code,Line,Column,Source,Raw");
+            foreach (CompileErrorRecord error in errors)
+            {
+                sb.AppendLine(string.Join(",", new[]
+                {
+                    EscapeCsv(error.File),
+                    EscapeCsv(error.Message),
+                    EscapeCsv(error.Code),
+                    EscapeCsv(error.Line.HasValue ? error.Line.Value.ToString(CultureInfo.InvariantCulture) : ""),
+                    EscapeCsv(error.Column.HasValue ? error.Column.Value.ToString(CultureInfo.InvariantCulture) : ""),
+                    EscapeCsv(error.Source),
+                    EscapeCsv(error.Raw)
+                }));
+            }
+            AtomicWriteText(path, sb.ToString());
+        }
+
+        private void WriteCompileErrorsText(string path, List<CompileErrorRecord> errors)
+        {
+            StringBuilder sb = new StringBuilder();
+            foreach (CompileErrorRecord error in errors)
+            {
+                sb.Append(error.File ?? "");
+                if (error.Line.HasValue || error.Column.HasValue)
+                    sb.Append("(").Append(error.Line.HasValue ? error.Line.Value.ToString(CultureInfo.InvariantCulture) : "0").Append(",").Append(error.Column.HasValue ? error.Column.Value.ToString(CultureInfo.InvariantCulture) : "0").Append(")");
+                if (!string.IsNullOrWhiteSpace(error.Code))
+                    sb.Append(" ").Append(error.Code).Append(":");
+                sb.Append(" ").Append(error.Message ?? error.Raw ?? "");
+                sb.AppendLine();
+            }
+            AtomicWriteText(path, sb.ToString());
+        }
+
+        private void WriteCompileResultJson(
+            string path,
+            string runId,
+            string state,
+            string strategyName,
+            string sourceFile,
+            string outputDir,
+            List<CompileErrorRecord> errors,
+            string csvPath,
+            string textPath,
+            string lastError)
+        {
+            StringBuilder sb = new StringBuilder();
+            sb.Append("{");
+            sb.Append("\"schemaVersion\":1,");
+            sb.Append("\"runId\":").Append(EncodeJsonString(runId)).Append(",");
+            sb.Append("\"state\":").Append(EncodeJsonString(state)).Append(",");
+            sb.Append("\"strategyName\":").Append(EncodeJsonString(strategyName)).Append(",");
+            sb.Append("\"sourceFile\":").Append(EncodeJsonString(sourceFile)).Append(",");
+            sb.Append("\"compiled\":").Append(state == "succeeded" ? "true" : "false").Append(",");
+            sb.Append("\"errorCount\":").Append(errors.Count.ToString(CultureInfo.InvariantCulture)).Append(",");
+            sb.Append("\"errorsCsv\":").Append(EncodeJsonString(csvPath)).Append(",");
+            sb.Append("\"errorsText\":").Append(EncodeJsonString(textPath)).Append(",");
+            sb.Append("\"lastError\":").Append(EncodeJsonString(lastError)).Append(",");
+            sb.Append("\"outputRoot\":").Append(EncodeJsonString(outputDir)).Append(",");
+            sb.Append("\"errors\":[");
+            for (int i = 0; i < errors.Count; i++)
+            {
+                CompileErrorRecord error = errors[i];
+                if (i > 0) sb.Append(",");
+                sb.Append("{");
+                sb.Append("\"file\":").Append(EncodeJsonString(error.File)).Append(",");
+                sb.Append("\"line\":").Append(error.Line.HasValue ? error.Line.Value.ToString(CultureInfo.InvariantCulture) : "null").Append(",");
+                sb.Append("\"column\":").Append(error.Column.HasValue ? error.Column.Value.ToString(CultureInfo.InvariantCulture) : "null").Append(",");
+                sb.Append("\"code\":").Append(EncodeJsonString(error.Code)).Append(",");
+                sb.Append("\"message\":").Append(EncodeJsonString(error.Message)).Append(",");
+                sb.Append("\"raw\":").Append(EncodeJsonString(error.Raw)).Append(",");
+                sb.Append("\"source\":").Append(EncodeJsonString(error.Source));
+                sb.Append("}");
+            }
+            sb.Append("],");
+            sb.Append("\"heartbeatUtc\":").Append(EncodeJsonString(DateTime.UtcNow.ToString("o", CultureInfo.InvariantCulture)));
+            sb.Append("}");
+            AtomicWriteText(path, sb.ToString());
         }
 
         private static string EncodeJsonString(string s)
@@ -551,6 +1059,7 @@ namespace NinjaTraderAddOnProject
             bool closeTempTabs = true;
             bool overwriteOutput = true;
             int rollingDays = 0;
+            int timeoutSeconds = 600;
             Dispatcher.Invoke(() =>
             {
                 sourceFolder = txtSourceFolder.Text;
@@ -558,6 +1067,7 @@ namespace NinjaTraderAddOnProject
                 useRollingDateRange = chkRollingDateRange.IsChecked == true;
                 closeTempTabs = chkCloseTempTabs.IsChecked == true;
                 overwriteOutput = chkOverwriteOutput.IsChecked == true;
+                timeoutSeconds = Math.Max(5, requestedTimeoutSeconds);
                 if (useRollingDateRange)
                     int.TryParse(txtRollingDays.Text, NumberStyles.Integer, CultureInfo.InvariantCulture, out rollingDays);
             });
@@ -608,6 +1118,7 @@ namespace NinjaTraderAddOnProject
             DateTime rollingFrom = rollingTo.AddDays(-rollingDays);
 
             Log("Starting batch with " + templates.Count + " templates.");
+            Log("Per-template timeout: " + timeoutSeconds.ToString(CultureInfo.InvariantCulture) + " seconds.");
             if (useRollingDateRange)
                 Log("Rolling date range enabled: " + rollingFrom.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture) + " to " + rollingTo.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture) + ".");
 
@@ -617,6 +1128,15 @@ namespace NinjaTraderAddOnProject
             currentTemplateName = null;
             lastErrorMessage = null;
             WriteStatus("starting");
+
+            // Deferred close of the previously-completed tab. Closing each
+            // tab immediately after its export raced NT's post-run UI
+            // dispatcher chain (StrategyAnalyzerViewModel.RunEntryDetails
+            // -> SetTabUiEnabled), which threw NullReferenceException on the
+            // disposed tab and panicked NT. The tab is held until the next
+            // template's run is in flight, by which point NT has drained
+            // those callbacks.
+            object pendingCloseTab = null;
 
             foreach (string path in templates)
             {
@@ -694,11 +1214,23 @@ namespace NinjaTraderAddOnProject
                     lastErrorMessage = "SetupError: " + record.Error;
                     WriteStatus("running");
                     CloseBatchTabIfEnabled(batchTab, closeTempTabs);
+                    if (pendingCloseTab != null)
+                    {
+                        CloseBatchTabIfEnabled(pendingCloseTab, closeTempTabs);
+                        pendingCloseTab = null;
+                    }
                     WriteBatchRunSummaryCsv(batchSummaryPath, summaryRecords);
                     continue;
                 }
 
-                // Small delay to allow UI to settle after template load
+                // Allow the UI to settle after the template load, then dispatch the
+                // run. Heavier strategies (e.g. PantheonMaster, 60+ optimization
+                // parameters) intermittently take longer than a single fixed delay
+                // to make the freshly-loaded Optimize tab the active, *runnable* tab.
+                // A one-shot RunCommand.CanExecute check then loses that race and the
+                // template is wrongly skipped as "Run command was not executable"
+                // (observed wedging batches at ~50-75 templates). Poll for runnability
+                // across several short, UI-yielding attempts instead of a single shot.
                 await Task.Delay(1000);
                 if (cancelRequested)
                 {
@@ -708,38 +1240,85 @@ namespace NinjaTraderAddOnProject
                     break;
                 }
 
-                Dispatcher.Invoke(() =>
+                const int maxRunAttempts = 12; // ~6s of extra settle budget beyond the 1s above
+                bool dispatched = false;
+                Exception runException = null;
+                for (int attempt = 1; attempt <= maxRunAttempts; attempt++)
                 {
-                    try
+                    if (cancelRequested)
+                        break;
+                    Dispatcher.Invoke(() =>
                     {
-                        StrategyAnalyzerAutomation.Run(saWindow);
-                        record.Status = "Running";
-                    }
-                    catch (Exception ex)
-                    {
-                        record.Status = "RunError";
-                        record.Error = Unwrap(ex);
-                        record.RunEndTime = DateTime.Now;
-                        Log("Run error: " + record.Error);
-                    }
-                });
+                        try
+                        {
+                            dispatched = StrategyAnalyzerAutomation.Run(saWindow);
+                        }
+                        catch (Exception ex)
+                        {
+                            runException = ex;
+                        }
+                    });
+                    if (dispatched || runException != null)
+                        break;
+                    if (attempt < maxRunAttempts)
+                        await Task.Delay(500); // yield the UI thread so the new tab can become runnable
+                }
+
+                if (cancelRequested)
+                {
+                    record.Status = "Cancelled";
+                    record.RunEndTime = DateTime.Now;
+                    WriteBatchRunSummaryCsv(batchSummaryPath, summaryRecords);
+                    break;
+                }
+
+                if (dispatched)
+                {
+                    record.Status = "Running";
+                }
+                else
+                {
+                    record.Status = "RunError";
+                    record.Error = runException != null
+                        ? Unwrap(runException)
+                        : "Strategy Analyzer Run command was not executable after "
+                            + maxRunAttempts.ToString(CultureInfo.InvariantCulture) + " attempts.";
+                    record.RunEndTime = DateTime.Now;
+                    Log("Run error: " + record.Error);
+                }
 
                 if (record.Status == "RunError")
                 {
                     lastErrorMessage = "RunError: " + record.Error;
                     WriteStatus("running");
                     CloseBatchTabIfEnabled(batchTab, closeTempTabs);
+                    if (pendingCloseTab != null)
+                    {
+                        CloseBatchTabIfEnabled(pendingCloseTab, closeTempTabs);
+                        pendingCloseTab = null;
+                    }
                     WriteBatchRunSummaryCsv(batchSummaryPath, summaryRecords);
                     continue;
                 }
 
+                // New run is in flight; safe to close the previously-completed
+                // tab now. NT's post-run callback chain on that tab has had
+                // the template-load settle delay plus a Run dispatch to drain.
+                if (pendingCloseTab != null)
+                {
+                    CloseBatchTabIfEnabled(pendingCloseTab, closeTempTabs);
+                    pendingCloseTab = null;
+                }
+
                 Log("Running backtest...");
-                bool completed = await WaitForRunCompletion(resultCountBeforeRun, TimeSpan.FromMinutes(10));
+                bool completed = await WaitForRunCompletion(resultCountBeforeRun, TimeSpan.FromSeconds(timeoutSeconds));
                 if (cancelRequested)
                 {
                     record.Status = "Cancelled";
                     record.RunEndTime = DateTime.Now;
-                    CloseBatchTab(batchTab);
+                    // Defer close to the post-loop flush; closing here races
+                    // NT's in-flight run callbacks.
+                    pendingCloseTab = batchTab;
                     WriteBatchRunSummaryCsv(batchSummaryPath, summaryRecords);
                     break;
                 }
@@ -747,6 +1326,8 @@ namespace NinjaTraderAddOnProject
                 if (!completed)
                 {
                     record.Status = "TimedOut";
+                    record.Error = "Timed out after " + timeoutSeconds.ToString(CultureInfo.InvariantCulture) + " seconds waiting for Strategy Analyzer results.";
+                    lastErrorMessage = record.Error;
                     Log("Timed out waiting for results; exporting whatever is available.");
                 }
 
@@ -761,10 +1342,27 @@ namespace NinjaTraderAddOnProject
 
                 record.RunEndTime = DateTime.Now;
                 WriteBatchRunSummaryCsv(batchSummaryPath, summaryRecords);
-                CloseBatchTabIfEnabled(batchTab, closeTempTabs);
+                // Defer the close to the next iteration's mid-run dispatch
+                // point so NT's RunEntryDetails -> SetTabUiEnabled callback
+                // chain finishes on this tab before it gets disposed.
+                pendingCloseTab = batchTab;
 
                 currentCompletedCount++;
                 WriteStatus("running");
+            }
+
+            // Flush the last deferred close with a delay so the final
+            // template's post-run callbacks have time to drain. Cancel
+            // forces close regardless of closeTempTabs to match the original
+            // immediate-close semantics on the cancel path.
+            if (pendingCloseTab != null)
+            {
+                if (closeTempTabs || cancelRequested)
+                {
+                    await Task.Delay(2000);
+                    CloseBatchTab(pendingCloseTab);
+                }
+                pendingCloseTab = null;
             }
 
             currentTemplateName = null;
@@ -844,7 +1442,8 @@ namespace NinjaTraderAddOnProject
             {
                 try
                 {
-                    StrategyAnalyzerAutomation.CloseTab(saWindow, tab);
+                    string diag = StrategyAnalyzerAutomation.CloseTab(saWindow, tab);
+                    Log(diag);
                     if (ReferenceEquals(currentBatchTab, tab))
                         currentBatchTab = null;
                 }
@@ -1642,14 +2241,48 @@ namespace NinjaTraderAddOnProject
             return ex.Message;
         }
 
+        private static readonly object logFileLock = new object();
+
+        // Where the readable batch log is written so it can be inspected outside
+        // NinjaTrader (the NinjaScript Output window is not persisted to disk).
+        // Prefer the current run's dest folder; fall back to C:\temp.
+        private string LogFilePath()
+        {
+            try
+            {
+                string dir = (!string.IsNullOrWhiteSpace(currentDestFolder) && Directory.Exists(currentDestFolder))
+                    ? currentDestFolder
+                    : @"C:\temp";
+                return Path.Combine(dir, "nt8_addon_batch.log");
+            }
+            catch
+            {
+                return @"C:\temp\nt8_addon_batch.log";
+            }
+        }
+
         private void Log(string msg)
         {
+            string line = "[" + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture) + "] " + msg;
+
+            // File sink first so diagnostics survive even if the UI thread is busy
+            // or NinjaTrader crashes. Best-effort; never throw from logging.
+            try
+            {
+                string path = LogFilePath();
+                lock (logFileLock)
+                {
+                    File.AppendAllText(path, line + Environment.NewLine);
+                }
+            }
+            catch { }
+
             Dispatcher.BeginInvoke(new Action(() =>
             {
                 if (outputBox == null)
                     return;
 
-                outputBox.AppendText("[" + DateTime.Now.ToString("HH:mm:ss", CultureInfo.InvariantCulture) + "] " + msg + Environment.NewLine);
+                outputBox.AppendText(line + Environment.NewLine);
                 outputBox.ScrollToEnd();
                 NinjaTrader.Code.Output.Process("BatchStrategyOptimizer: " + msg, NinjaTrader.NinjaScript.PrintTo.OutputTab1);
             }));
